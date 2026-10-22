@@ -31,6 +31,7 @@ hapi = ["hitran-api"]
 zenodo = ["zenodo-get"]
 dev = ["ruff", "sphinx", "sphinx_book_theme", "myst-nb", "sphinx_design", "sphinx-github-changelog", "sphinxcontrib-bibtex"]
 complete = ["sasktran2[solar,hapi,zenodo]"]
+merra2-build = ["fsspec", "h5netcdf"]
 
 [tool.pixi.project]
 channels = ["conda-forge"]
@@ -98,7 +99,9 @@ python-packages = ["sasktran2"]
 module-name = "sasktran2._core_rust"
 include = [
     { path = "src/sasktran2/_data/stratospheric_aerosol/*", format = ["sdist", "wheel"] },
+    { path = "src/sasktran2/_data/tropospheric_aerosol/*", format = ["sdist", "wheel"] },
     { path = "tools/databases/stratospheric_aerosol/*", format = "sdist" },
+    { path = "tools/databases/tropospheric_aerosol/*", format = "sdist" },
     { path = "rust-toolchain.toml", format = "sdist" },
     { path = "Cargo.lock", format = "sdist" },
 ]

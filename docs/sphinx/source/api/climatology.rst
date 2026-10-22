@@ -30,6 +30,17 @@ See the :ref:`stratospheric aerosol example <_example_stratospheric_aerosol>`.
     sasktran2.climatology.stratospheric_aerosol
 
 
+Tropospheric Aerosol Reference Scenarios
+----------------------------------------
+Monthly MERRA2 aerosol extinction profiles for the SAGE latitude bands and
+loading levels.
+
+.. autosummary::
+    :toctree: generated/
+
+    sasktran2.climatology.tropospheric_aerosol
+
+
 MIPAS Reference Atmospheres
 ---------------------------
 .. autosummary::
