@@ -26,7 +26,7 @@ streaming smoke test:
 ```bash
 cd /path/to/sasktran2
 uv venv --python 3.12
-uv pip install --python .venv/bin/python numpy xarray fsspec h5netcdf
+uv pip install --python .venv/bin/python numpy xarray "fsspec[http]" h5netcdf
 .venv/bin/python -c "import fsspec, h5netcdf, numpy, xarray; print('MERRA2 build environment ready')"
 ```
 
@@ -36,6 +36,8 @@ extra includes `astropy>=7`, which requires Python 3.11+, while this project
 declares Python 3.10+ support. That cross-version resolution can fail even
 though the smoke-test builder itself does not need `astropy` or the SASKTRAN2
 extension.
+The `http` extra installs the `requests` and `aiohttp` backends required by
+fsspec for GES DISC HTTP range reads.
 
 If `uv` is not already available, install it using the cluster's approved
 method, or its official user-local installer:

@@ -31,7 +31,7 @@ hapi = ["hitran-api"]
 zenodo = ["zenodo-get"]
 dev = ["ruff", "sphinx", "sphinx_book_theme", "myst-nb", "sphinx_design", "sphinx-github-changelog", "sphinxcontrib-bibtex"]
 complete = ["sasktran2[solar,hapi,zenodo]"]
-merra2-build = ["fsspec", "h5netcdf"]
+merra2-build = ["fsspec[http]", "h5netcdf"]
 
 [tool.pixi.project]
 channels = ["conda-forge"]
