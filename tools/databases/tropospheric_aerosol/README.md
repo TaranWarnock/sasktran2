@@ -20,15 +20,22 @@ partial coverage is never mistaken for a climatology.
 ## Set up Python with uv on DRAC
 
 From the repository checkout on the cluster login node, create an isolated
-environment with the dependencies needed by the builder and cloud-streaming
-smoke test. `--no-install-project` avoids building the SASKTRAN2 Rust/C++
-extension; these scripts import the builder directly and do not need it.
+environment with only the dependencies needed by the builder and cloud-
+streaming smoke test:
 
 ```bash
 cd /path/to/sasktran2
-uv sync --python 3.12 --extra merra2-build --no-install-project
+uv venv --python 3.12
+uv pip install --python .venv/bin/python numpy xarray fsspec h5netcdf
 .venv/bin/python -c "import fsspec, h5netcdf, numpy, xarray; print('MERRA2 build environment ready')"
 ```
+
+Use `uv pip install` rather than `uv sync` here: syncing the project resolves
+its full declared Python support range and optional extras. The `complete`
+extra includes `astropy>=7`, which requires Python 3.11+, while this project
+declares Python 3.10+ support. That cross-version resolution can fail even
+though the smoke-test builder itself does not need `astropy` or the SASKTRAN2
+extension.
 
 If `uv` is not already available, install it using the cluster's approved
 method, or its official user-local installer:
