@@ -92,7 +92,7 @@ def load_efficiency_curves(
         if not path.is_file():
             msg = f"Missing MERRA2 aerosol optical table: {path}"
             raise FileNotFoundError(msg)
-        with xr.open_dataset(path) as data:
+        with xr.open_dataset(path, engine="scipy") as data:
             if data["bext"].attrs.get("units") != "m2 (kg dry mass)-1":
                 msg = f"{filename} bext must have units 'm2 (kg dry mass)-1'"
                 raise ValueError(msg)

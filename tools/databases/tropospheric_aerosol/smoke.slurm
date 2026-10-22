@@ -12,9 +12,9 @@ REPOSITORY="${SLURM_SUBMIT_DIR:?Submit this job from the repository root}"
 TEST_DATE="${TEST_DATE:-2024-01-01}"
 OPTICS_ROOT="${OPTICS_ROOT:?Set OPTICS_ROOT to the MERRA-2 optical tables directory}"
 OUTPUT_DIR="${OUTPUT_DIR:-${HOME}/scratch/output/sasktran/smoke-${TEST_DATE}}"
-PYTHON="${PYTHON:-${REPOSITORY}/.venv/bin/python}"
 
 cd "$REPOSITORY"
+source tools/databases/tropospheric_aerosol/setup_job_env.sh
 "$PYTHON" tools/databases/tropospheric_aerosol/build.py \
     --optics-root "$OPTICS_ROOT" \
     --output "$OUTPUT_DIR" \

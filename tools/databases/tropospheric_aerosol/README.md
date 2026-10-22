@@ -17,39 +17,34 @@ granules instead, pass `--data-root` with `M2I1NXASM`, `M2I3NVAER`, and
 analysis period. Local builds fail on the first missing product day so that
 partial coverage is never mistaken for a climatology.
 
-## Set up Python with uv on DRAC
+## Python environment on DRAC
 
-From the repository checkout on the cluster login node, create an isolated
-environment with only the dependencies needed by the builder and cloud-
-streaming smoke test:
+Each Slurm job creates its own virtual environment on the compute node under
+`$SLURM_TMPDIR`. The shared setup script loads the Alliance modules in order:
+`StdEnv/2023`, `python/3.12.4`, then the default (latest) `scipy-stack` module.
+The venv uses `--system-site-packages` to reuse NumPy, SciPy, and other packages
+from `scipy-stack`; pip installs the remaining packages from Alliance's local
+wheelhouse with `--no-index`. The environment is temporary and is recreated
+for each job.
 
-```bash
-cd /path/to/sasktran2
-uv venv --python 3.12
-uv pip install --python .venv/bin/python numpy xarray "fsspec[http]" h5netcdf
-.venv/bin/python -c "import fsspec, h5netcdf, numpy, xarray; print('MERRA2 build environment ready')"
+No login-node environment setup is needed. The smoke and catalogue Slurm
+scripts source `tools/databases/tropospheric_aerosol/setup_job_env.sh` before
+running the builder. It verifies the HTTP and NetCDF backends are importable
+before beginning the MERRA2 work.
+
+For GES DISC authentication, configure Earthdata Login credentials in
+`~/.netrc` on the cluster and restrict its permissions:
+
+```text
+machine urs.earthdata.nasa.gov login YOUR_EARTHDATA_USERNAME password YOUR_EARTHDATA_PASSWORD
 ```
 
-Use `uv pip install` rather than `uv sync` here: syncing the project resolves
-its full declared Python support range and optional extras. The `complete`
-extra includes `astropy>=7`, which requires Python 3.11+, while this project
-declares Python 3.10+ support. That cross-version resolution can fail even
-though the smoke-test builder itself does not need `astropy` or the SASKTRAN2
-extension.
-The `http` extra installs the `requests` and `aiohttp` backends required by
-fsspec for GES DISC HTTP range reads.
-
-If `uv` is not already available, install it using the cluster's approved
-method, or its official user-local installer:
-
 ```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
+chmod 600 ~/.netrc
 ```
 
-After setting up the environment, the Slurm scripts default to
-`.venv/bin/python`; `PYTHON` can be set to another interpreter path if desired.
-Ensure dependencies can be installed on the login node before submitting,
-since compute nodes may have different network/package access.
+Do not commit or share the credential file. Test the environment and access
+with the one-day smoke job before submitting the longer yearly build.
 
 For GES DISC authentication, configure Earthdata Login credentials in
 `~/.netrc` on the cluster and restrict its permissions:
@@ -93,9 +88,8 @@ directly. Set `START_YEAR` and `END_YEAR` to change the period, and set
 `OUTPUT_DIR` to choose where the catalogue and build report are written. For
 example, a complete-history run can be submitted with
 `START_YEAR=1980,END_YEAR=2025`; retain a separate output directory for this
-one-year test. The Python environment used by the job must have the optional
-`merra2-build` dependencies installed, and Earthdata credentials must be
-available in the submitting user's netrc file. The submission helper creates
+one-year test. Earthdata credentials must be available in the submitting
+user's netrc file. The submission helper creates
 `~/scratch/output/sasktran` before submission and puts the Slurm log there;
 the catalogue and report are written to its year-specific subdirectory by
 default.
@@ -105,8 +99,9 @@ bash tools/databases/tropospheric_aerosol/submit.sh \
   --export=ALL,OPTICS_ROOT=/path/to/MERRA-2-Versions/v0.0.0,START_YEAR=1980,END_YEAR=2025
 ```
 
-For local runs, set `--workers` to process the four climatology months
-concurrently. Keep the worker count within the memory and CPU allocation.
+For local runs, install the optional `merra2-build` dependencies and set
+`--workers` to process the four climatology months concurrently. Keep the
+worker count within the memory and CPU allocation.
 Set `OUTPUT_ROOT` before invoking `submit.sh` to use another location for logs;
 set `OUTPUT_DIR` via `--export` to override the default catalogue directory.
 

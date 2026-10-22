@@ -15,9 +15,9 @@ END_YEAR="${END_YEAR:-$START_YEAR}"
 WORKERS="${SLURM_CPUS_PER_TASK:-4}"
 OPTICS_ROOT="${OPTICS_ROOT:?Set OPTICS_ROOT to the MERRA-2 optical tables directory}"
 OUTPUT_DIR="${OUTPUT_DIR:-${HOME}/scratch/output/sasktran/${START_YEAR}-${END_YEAR}}"
-PYTHON="${PYTHON:-${REPOSITORY}/.venv/bin/python}"
 
 cd "$REPOSITORY"
+source tools/databases/tropospheric_aerosol/setup_job_env.sh
 "$PYTHON" tools/databases/tropospheric_aerosol/build.py \
     --optics-root "$OPTICS_ROOT" \
     --output "$OUTPUT_DIR" \

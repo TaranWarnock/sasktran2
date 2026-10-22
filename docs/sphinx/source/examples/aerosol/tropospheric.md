@@ -92,7 +92,8 @@ The compact runtime catalogue is built offline from MERRA2 products
 `M2I3NVAER`, `M2I3NVASM`, and `M2I1NXASM`, together with the five MERRA2 aerosol
 optical tables. The builder streams source granules from GES DISC using
 authenticated HTTP range reads; it does not download complete granules. Create
-an Earthdata Login netrc entry and install the optional build dependencies:
+an Earthdata Login netrc entry. For a local run, install the optional build
+dependencies:
 
 ```bash
 pip install -e ".[merra2-build]"
@@ -109,7 +110,9 @@ On DRAC, submit via
 `~/scratch/output/sasktran`, save the Slurm log there, and write the catalogue
 and report to a year-specific subdirectory. The four-worker job defaults to
 one complete year (2024). Set `START_YEAR`, `END_YEAR`, and `OPTICS_ROOT` at
-submission time to control the period and cluster optical-table location.
+submission time to control the period and cluster optical-table location. Each
+job loads `StdEnv/2023`, Python 3.12.4, and the default/latest `scipy-stack`
+module, then builds its own virtual environment under `$SLURM_TMPDIR`.
 For a quick one-day connectivity and calculation check, use
 `JOB_SCRIPT=tools/databases/tropospheric_aerosol/smoke.slurm` and set
 `TEST_DATE=YYYY-MM-DD`; it processes all aerosol timestamps for one sample

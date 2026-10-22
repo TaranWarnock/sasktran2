@@ -233,7 +233,7 @@ def optics_root(tmp_path):
                 "rh": humidity,
                 "lambda": ("lambda", wavelengths, {"units": "m"}),
             },
-        ).to_netcdf(tmp_path / filename)
+        ).to_netcdf(tmp_path / filename, engine="scipy")
     return tmp_path
 
 
