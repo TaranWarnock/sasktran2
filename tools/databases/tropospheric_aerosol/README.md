@@ -84,7 +84,10 @@ under `~/scratch/output/sasktran/smoke-YYYY-MM-DD` by default. Change
 `TEST_DATE` to a date with available MERRA2 inputs.
 
 The job uses four concurrent month workers and streams GES DISC granules
-directly. Set `START_YEAR` and `END_YEAR` to change the period, and set
+directly. Transient HTTP failures (429 and common 5xx responses, connection
+errors, and timeouts) get up to five attempts with backoff; persistent
+failures stop the job with the original exception. Set `START_YEAR` and
+`END_YEAR` to change the period, and set
 `OUTPUT_DIR` to choose where the catalogue and build report are written. For
 example, a complete-history run can be submitted with
 `START_YEAR=1980,END_YEAR=2025`; retain a separate output directory for this

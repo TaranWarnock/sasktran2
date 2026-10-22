@@ -3,7 +3,9 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import sys
+import threading
 from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import numpy as np
@@ -370,6 +372,63 @@ def test_smoke_test_reads_and_processes_one_column(optics_root, monkeypatch):
     assert result["tropospheric_levels_per_timestamp"] == [1, 1]
     assert len(result["tropospheric_aod_550nm_per_timestamp"]) == 2
     assert result["tropospheric_aod_550nm_min"] > 0
+
+
+def test_remote_granule_retries_transient_http_failures(tmp_path):
+    pytest.importorskip("aiohttp")
+    pytest.importorskip("h5netcdf")
+    netcdf_path = tmp_path / "remote.nc"
+    xr.Dataset({"sample": ("x", np.arange(4, dtype=np.float32))}).to_netcdf(
+        netcdf_path, engine="h5netcdf"
+    )
+    content = netcdf_path.read_bytes()
+    requests = {"head": 0, "get": 0}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_HEAD(self):
+            requests["head"] += 1
+            if requests["head"] == 1:
+                self.send_error(503)
+                return
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(content)))
+            self.send_header("Accept-Ranges", "bytes")
+            self.end_headers()
+
+        def do_GET(self):
+            requests["get"] += 1
+            if requests["get"] == 1:
+                self.send_error(503)
+                return
+            start, end = map(
+                int, self.headers["Range"].removeprefix("bytes=").split("-")
+            )
+            end = min(end, len(content) - 1)
+            data = content[start : end + 1]
+            self.send_response(206)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Content-Range", f"bytes {start}-{end}/{len(content)}")
+            self.send_header("Accept-Ranges", "bytes")
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, *_args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with build._open_granule(
+            f"http://127.0.0.1:{server.server_port}/remote.nc"
+        ) as dataset:
+            result = dataset["sample"].load().values
+        assert_allclose(result, np.arange(4, dtype=np.float32))
+        assert requests == {"head": 2, "get": 2}
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
 
 
 def test_area_weighted_reservoir_keeps_representative_profiles():

@@ -8,14 +8,18 @@ uses locally available granules instead.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import importlib
 import json
 import logging
-from concurrent.futures import ProcessPoolExecutor
+import random
+import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from types import MethodType
 
 import numpy as np
 import xarray as xr
@@ -263,16 +267,91 @@ def _open_granule(location: Path | str):
             yield data
     else:
         try:
-            fsspec = importlib.import_module("fsspec")
+            aiohttp = importlib.import_module("aiohttp")
+            fsspec_async = importlib.import_module("fsspec.asyn")
+            http_module = importlib.import_module("fsspec.implementations.http")
         except ImportError as exc:
-            msg = "Install sasktran2[merra2-build] to stream GES DISC granules"
+            msg = (
+                "Install the MERRA2 build dependencies, including "
+                "fsspec[http], to stream GES DISC granules"
+            )
             raise ImportError(msg) from exc
+
+        def retryable(error: Exception) -> bool:
+            if isinstance(error, aiohttp.ClientResponseError):
+                return error.status in {429, 500, 502, 503, 504}
+            return isinstance(
+                error,
+                (aiohttp.ClientConnectionError, asyncio.TimeoutError, OSError),
+            )
+
+        def retry_delay(attempt: int) -> float:
+            return min(2**attempt, 30) + random.uniform(0, 1)
+
+        class RetryingHTTPFileSystem(http_module.HTTPFileSystem):
+            def _open(self, *args, **kwargs):
+                for attempt in range(5):
+                    try:
+                        remote_file = super()._open(*args, **kwargs)
+                        break
+                    except (
+                        aiohttp.ClientResponseError,
+                        aiohttp.ClientConnectionError,
+                        asyncio.TimeoutError,
+                        OSError,
+                    ) as exc:
+                        if not retryable(exc) or attempt == 4:
+                            raise
+                        delay = retry_delay(attempt)
+                        logging.warning(
+                            "Transient GES DISC open failure (%s); retrying in %.1f s",
+                            type(exc).__name__,
+                            delay,
+                        )
+                        time.sleep(delay)
+
+                original_fetch = remote_file.async_fetch_range
+
+                async def fetch_with_retry(_file, start, end):
+                    attempt = 0
+                    while attempt < 5:
+                        try:
+                            return await original_fetch(start, end)
+                        except (
+                            aiohttp.ClientResponseError,
+                            aiohttp.ClientConnectionError,
+                            asyncio.TimeoutError,
+                            OSError,
+                        ) as exc:
+                            if not retryable(exc) or attempt == 4:
+                                raise
+                            delay = retry_delay(attempt)
+                            logging.warning(
+                                "Transient GES DISC range failure (%s); "
+                                "retrying in %.1f s",
+                                type(exc).__name__,
+                                delay,
+                            )
+                            attempt += 1
+                            await asyncio.sleep(delay)
+                    msg = "HTTP range retry loop exited unexpectedly"
+                    raise RuntimeError(msg)
+
+                remote_file.async_fetch_range = MethodType(
+                    fetch_with_retry, remote_file
+                )
+                remote_file.cache.fetcher = fsspec_async.sync_wrapper(
+                    remote_file.async_fetch_range, remote_file
+                )
+                return remote_file
+
         with (
-            fsspec.open(
-                location,
-                "rb",
+            RetryingHTTPFileSystem(
                 block_size=8 * 1024 * 1024,
                 client_kwargs={"trust_env": True},
+            ).open(
+                location,
+                "rb",
             ) as stream,
             xr.open_dataset(stream, engine="h5netcdf") as data,
         ):
@@ -891,7 +970,7 @@ def build_catalogue(
             logging.info("Processing MERRA2 month %02d", arguments[0])
             month_records.append(_process_month(*arguments))
     else:
-        with ProcessPoolExecutor(max_workers=workers) as executor:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = [
                 executor.submit(_process_month, *arguments)
                 for arguments in month_arguments
