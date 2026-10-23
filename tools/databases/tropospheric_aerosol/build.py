@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import calendar
 import hashlib
 import importlib
 import json
@@ -22,6 +23,7 @@ from pathlib import Path
 from types import MethodType
 
 import numpy as np
+import sasktran2 as sk
 import xarray as xr
 
 _MONTHS = (1, 4, 7, 10)
@@ -56,6 +58,7 @@ _TARGET_ALTITUDES_M = np.arange(0.0, 20001.0, 250.0)
 _GAS_CONSTANT_DRY_AIR = 287.05
 _STANDARD_GRAVITY = 9.80665
 _GES_DISC_ROOT = "https://data.gesdisc.earthdata.nasa.gov/data/MERRA2"
+_EGM2008_DATABASE_KEY = "geodesy/EGM2008/EGM2008_MERRA2.nc"
 _PRODUCTS = {
     "aerosol": ("M2I3NVAER", "inst3_3d_aer_Nv"),
     "meteorology": ("M2I3NVASM", "inst3_3d_asm_Nv"),
@@ -82,10 +85,59 @@ def _required_units(data: xr.Dataset, variable: str, units: str) -> None:
         raise ValueError(msg)
 
 
-def load_efficiency_curves(
+def _load_geoid_undulation() -> xr.DataArray:
+    path = sk.database.StandardDatabase().path(_EGM2008_DATABASE_KEY)
+    if path is None or not path.is_file():
+        msg = f"Unable to load EGM2008 geoid undulation grid: {path}"
+        raise FileNotFoundError(msg)
+    with xr.open_dataarray(path) as data:
+        if not {"lat", "lon"} <= set(data.coords):
+            msg = "EGM2008 grid must have lat and lon coordinates"
+            raise ValueError(msg)
+        return data.load().sortby("lat").sortby("lon")
+
+
+def _interpolate_geoid_undulation(
+    geoid_undulation: xr.DataArray,
+    latitude: np.ndarray,
+    longitude: np.ndarray,
+) -> np.ndarray:
+    return geoid_undulation.interp(
+        lat=xr.DataArray(np.asarray(latitude, dtype=float), dims=("lat",)),
+        lon=xr.DataArray(np.asarray(longitude, dtype=float), dims=("lon",)),
+    ).values
+
+
+def _geoid_radius(latitude: np.ndarray) -> np.ndarray:
+    latitude_rad = np.deg2rad(np.asarray(latitude, dtype=float))
+    equatorial_radius_m = 6_378_137.0
+    polar_radius_m = equatorial_radius_m * (1 - 1 / 298.257223563)
+    return np.sqrt(
+        1
+        / (
+            np.cos(latitude_rad) ** 2 / equatorial_radius_m**2
+            + np.sin(latitude_rad) ** 2 / polar_radius_m**2
+        )
+    )
+
+
+def _geopotential_to_geometric_height(
+    geopotential_height_m: np.ndarray,
+    latitude: np.ndarray,
+) -> np.ndarray:
+    latitude_rad = np.deg2rad(2 * np.asarray(latitude, dtype=float))
+    gravity_ratio = (
+        1 - 0.002637 * np.cos(latitude_rad) + 0.0000059 * np.cos(latitude_rad) ** 2
+    )
+    earth_radius_m = _geoid_radius(latitude)
+    height = np.asarray(geopotential_height_m, dtype=float)
+    return height * earth_radius_m / (gravity_ratio * earth_radius_m - height)
+
+
+def load_efficiency_profiles(
     optics_dir: Path, wavelength_nm: float = 550.0
 ) -> tuple[dict[str, tuple[np.ndarray, np.ndarray]], np.ndarray]:
-    """Load species-bin mass-extinction efficiencies at requested wavelengths."""
+    """Load species-bin mass-extinction efficiency profiles."""
     if not np.isfinite(wavelength_nm) or wavelength_nm <= 0:
         msg = "wavelength_nm must be finite and positive"
         raise ValueError(msg)
@@ -106,7 +158,7 @@ def load_efficiency_curves(
             wavelength_grid = np.asarray(data["lambda"].values, dtype=float) * 1e9
             relative_humidity = np.asarray(data["rh"].values, dtype=float)
             wavelength_grids.append(wavelength_grid)
-            curves = {}
+            profiles = {}
             for species, (source, bin_index) in _COMPONENTS.items():
                 if source != filename:
                     continue
@@ -119,12 +171,12 @@ def load_efficiency_curves(
                     .transpose("rh", "lambda")
                     .values.astype(float)
                 )
-                curves[species] = (
+                profiles[species] = (
                     relative_humidity,
                     wavelength_grid,
                     values,
                 )
-            loaded[filename] = curves
+            loaded[filename] = profiles
 
     low = max(grid.min() for grid in wavelength_grids)
     high = min(grid.max() for grid in wavelength_grids)
@@ -153,10 +205,10 @@ def load_efficiency_curves(
 
 def _efficiency_at_wavelength(
     relative_humidity: np.ndarray,
-    curve: tuple[np.ndarray, np.ndarray],
+    profile: tuple[np.ndarray, np.ndarray],
     wavelength_index: int,
 ) -> np.ndarray:
-    rh_grid, spectral_values = curve
+    rh_grid, spectral_values = profile
     humidity = np.asarray(relative_humidity, dtype=float)
     column = spectral_values[:, wavelength_index]
     return np.interp(np.clip(humidity, rh_grid[0], rh_grid[-1]), rh_grid, column)
@@ -164,7 +216,7 @@ def _efficiency_at_wavelength(
 
 def calculate_extinction(
     aerosol: xr.Dataset,
-    efficiency_curves: dict[str, tuple[np.ndarray, np.ndarray]],
+    efficiency_profiles: dict[str, tuple[np.ndarray, np.ndarray]],
     wavelengths_nm: np.ndarray,
     wavelength_nm: float = 550.0,
 ) -> np.ndarray:
@@ -178,7 +230,7 @@ def calculate_extinction(
         msg = "MERRA2 AIRDENS and RH must use matching dimensions"
         raise ValueError(msg)
     result = np.zeros_like(air_density, dtype=np.float64)
-    for species, (rh_grid, spectral_values) in efficiency_curves.items():
+    for species, (rh_grid, spectral_values) in efficiency_profiles.items():
         if species not in aerosol:
             msg = f"MERRA2 aerosol input is missing required species {species!r}"
             raise ValueError(msg)
@@ -187,7 +239,7 @@ def calculate_extinction(
             msg = f"MERRA2 {species} dimensions do not match AIRDENS"
             raise ValueError(msg)
         values = spectral_values
-        curve = (
+        profile = (
             rh_grid,
             values,
         )
@@ -195,16 +247,16 @@ def calculate_extinction(
         lower = max(0, upper - 1)
         upper = min(upper, len(wavelengths_nm) - 1)
         if lower == upper:
-            efficiency = _efficiency_at_wavelength(relative_humidity, curve, lower)
+            efficiency = _efficiency_at_wavelength(relative_humidity, profile, lower)
         else:
             fraction = (wavelength_nm - wavelengths_nm[lower]) / (
                 wavelengths_nm[upper] - wavelengths_nm[lower]
             )
             lower_efficiency = _efficiency_at_wavelength(
-                relative_humidity, curve, lower
+                relative_humidity, profile, lower
             )
             upper_efficiency = _efficiency_at_wavelength(
-                relative_humidity, curve, upper
+                relative_humidity, profile, upper
             )
             efficiency = lower_efficiency * (1 - fraction) + upper_efficiency * fraction
         result += ratio * air_density * efficiency
@@ -213,7 +265,7 @@ def calculate_extinction(
 
 def calculate_spectral_extinction(
     aerosol: xr.Dataset,
-    efficiency_curves: dict[str, tuple[np.ndarray, np.ndarray]],
+    efficiency_profiles: dict[str, tuple[np.ndarray, np.ndarray]],
     wavelengths_nm: np.ndarray,
 ) -> np.ndarray:
     """Calculate one-column extinction for all wavelengths in m-1."""
@@ -221,7 +273,7 @@ def calculate_spectral_extinction(
     relative_humidity = np.asarray(aerosol["RH"].values, dtype=float)
     result = np.zeros((air_density.size, len(wavelengths_nm)), dtype=np.float64)
     humidity = np.clip(relative_humidity, 0.0, 0.99)
-    for species, (rh_grid, values) in efficiency_curves.items():
+    for species, (rh_grid, values) in efficiency_profiles.items():
         ratio = np.asarray(aerosol[species].values, dtype=float)
         if ratio.shape != air_density.shape:
             msg = f"MERRA2 {species} dimensions do not match AIRDENS"
@@ -437,7 +489,7 @@ def run_smoke_test(
         latitude = float(aerosol.lat.values[latitude_index])
         longitude = float(aerosol.lon.values[longitude_index])
 
-    efficiencies, wavelengths_nm = load_efficiency_curves(optics_root)
+    efficiencies, wavelengths_nm = load_efficiency_profiles(optics_root)
     extinction = calculate_extinction(aerosol_column, efficiencies, wavelengths_nm)
     pressure = meteorology_column.PL.values.astype(float)
     temperature = meteorology_column.T.values.astype(float)
@@ -716,7 +768,8 @@ def _read_column_spectrum(
     latitude_index: int,
     longitude_index: int,
     data_root: Path | None,
-    efficiency_curves: dict[str, tuple[np.ndarray, np.ndarray]],
+    geoid_undulation: xr.DataArray,
+    efficiency_profiles: dict[str, tuple[np.ndarray, np.ndarray]],
     wavelengths_nm: np.ndarray,
 ) -> np.ndarray:
     locations = {name: _file_for_product(name, day, data_root) for name in _PRODUCTS}
@@ -747,12 +800,30 @@ def _read_column_spectrum(
                 lon=longitude_index,
             ).values
         )
+        latitude = float(aerosol.lat.values[latitude_index])
+        longitude = float(aerosol.lon.values[longitude_index])
+        surface_geopotential_height = (
+            float(meteorology_column.PHIS.values) / _STANDARD_GRAVITY
+        )
+    geoid_offset = float(
+        _interpolate_geoid_undulation(
+            geoid_undulation, np.array([latitude]), np.array([longitude])
+        )[0, 0]
+    )
     extinction = calculate_spectral_extinction(
-        aerosol_column, efficiency_curves, wavelengths_nm
+        aerosol_column, efficiency_profiles, wavelengths_nm
     )
     pressure = meteorology_column.PL.values.astype(float)
-    height = meteorology_column.H.values.astype(float)
-    surface_height = float(meteorology_column.PHIS.values) / _STANDARD_GRAVITY
+    height = (
+        _geopotential_to_geometric_height(
+            meteorology_column.H.values.astype(float), latitude
+        )
+        + geoid_offset
+    )
+    surface_height = (
+        float(_geopotential_to_geometric_height(surface_geopotential_height, latitude))
+        + geoid_offset
+    )
     above = pressure < tropopause_pressure
     extinction[above, :] = 0
     order = np.argsort(height)
@@ -776,13 +847,18 @@ def _process_month(
     start_year: int,
     end_year: int,
     data_root: Path | None,
-    efficiency_curves: dict[str, tuple[np.ndarray, np.ndarray]],
+    geoid_undulation: xr.DataArray,
+    efficiency_profiles: dict[str, tuple[np.ndarray, np.ndarray]],
     wavelengths_nm: np.ndarray,
     reservoir_size: int,
     seed: int,
 ) -> list[dict]:
     rng = np.random.default_rng(seed + month)
     reservoirs = {band: _WeightedReservoir(reservoir_size, rng) for band in _BANDS}
+    total_days = sum(
+        calendar.monthrange(year, month)[1] for year in range(start_year, end_year + 1)
+    )
+    processed_days = 0
     for year in range(start_year, end_year + 1):
         day = date(year, month, 1)
         while day.month == month:
@@ -848,11 +924,30 @@ def _process_month(
                             msg = "MERRA2 source latitude/longitude grids do not match"
                             raise ValueError(msg)
                         extinction = calculate_extinction(
-                            aer_part, efficiency_curves, wavelengths_nm
+                            aer_part, efficiency_profiles, wavelengths_nm
                         )
                         model_pressure = met_part.PL.values.astype(float)
                         temperature = met_part.T.values.astype(float)
                         delp = aer_part.DELP.values.astype(float)
+                        latitude = aer_part.lat.values.astype(float)
+                        longitude = aer_part.lon.values.astype(float)
+                        geoid_offset = _interpolate_geoid_undulation(
+                            geoid_undulation, latitude, longitude
+                        )
+                        model_height = (
+                            _geopotential_to_geometric_height(
+                                met_part.H.values.astype(float),
+                                latitude[None, :, None],
+                            )
+                            + geoid_offset[None, :, :]
+                        )
+                        surface_altitude = (
+                            _geopotential_to_geometric_height(
+                                met_part.PHIS.values.astype(float) / _STANDARD_GRAVITY,
+                                latitude[:, None],
+                            )
+                            + geoid_offset
+                        )
                         with np.errstate(divide="ignore", invalid="ignore"):
                             layer_thickness = (
                                 _GAS_CONSTANT_DRY_AIR
@@ -861,12 +956,9 @@ def _process_month(
                                 * delp
                                 / model_pressure
                             )
-                        surface_altitude = (
-                            met_part.PHIS.values.astype(float) / _STANDARD_GRAVITY
-                        )
                         reservoirs[band].add(
                             extinction,
-                            met_part.H.values.astype(float),
+                            model_height,
                             model_pressure,
                             layer_thickness,
                             tp_part.values.astype(float),
@@ -877,6 +969,14 @@ def _process_month(
                             time_index,
                             latitude_indices,
                         )
+            processed_days += 1
+            logging.info(
+                "MERRA2 month %02d progress: %d/%d days complete (last: %s)",
+                month,
+                processed_days,
+                total_days,
+                day.isoformat(),
+            )
             day += timedelta(days=1)
 
     result = []
@@ -901,7 +1001,8 @@ def _process_month(
                 int(reservoir.latitude_index[index]),
                 int(reservoir.longitude_index[index]),
                 data_root,
-                efficiency_curves,
+                geoid_undulation,
+                efficiency_profiles,
                 wavelengths_nm,
             )
             result.append(
@@ -950,13 +1051,15 @@ def build_catalogue(
         msg = "workers must be at least 1"
         raise ValueError(msg)
     workers = int(workers)
-    efficiencies, wavelengths_nm = load_efficiency_curves(optics_root)
+    efficiencies, wavelengths_nm = load_efficiency_profiles(optics_root)
+    geoid_undulation = _load_geoid_undulation()
     month_arguments = [
         (
             month,
             start_year,
             end_year,
             data_root,
+            geoid_undulation,
             efficiencies,
             wavelengths_nm,
             reservoir_size,
@@ -1080,6 +1183,10 @@ def build_catalogue(
             "source_data_version": "MERRA2 5.12.4",
             "source_years": f"{start_year}-{end_year}",
             "tropopause_field": "M2I1NXASM TROPPB (blended tropopause pressure)",
+            "height_coordinate_definition": (
+                "MERRA2 geopotential height converted to geometric height and "
+                "offset by EGM2008 geoid undulation above the WGS84 ellipsoid"
+            ),
             "aod_definition": "Sum(extinction * hydrostatic layer thickness) for PL >= TROPPB",
             "layer_thickness_definition": "287.05 * T / 9.80665 * DELP / PL",
             "reference_wavelength_nm": 550.0,
@@ -1108,6 +1215,7 @@ def build_catalogue(
         "source_products": dataset.attrs["source_products"],
         "source_data_version": dataset.attrs["source_data_version"],
         "source_years": dataset.attrs["source_years"],
+        "height_coordinate_definition": dataset.attrs["height_coordinate_definition"],
         "optical_tables_sha256": optical_digests,
         "candidate_sampling_seed": seed,
         "candidate_reservoir_size": reservoir_size,

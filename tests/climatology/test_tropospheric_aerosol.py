@@ -242,7 +242,7 @@ def optics_root(tmp_path):
 def test_merra_extinction_uses_mass_density_humidity_and_wavelength(
     optics_root,
 ):
-    curves, wavelengths = build.load_efficiency_curves(optics_root)
+    profiles, wavelengths = build.load_efficiency_profiles(optics_root)
     assert 550 in wavelengths
     ratios = {name: np.full(2, 1e-8) for name in build._COMPONENTS}
     aerosol_data = xr.Dataset(
@@ -253,10 +253,47 @@ def test_merra_extinction_uses_mass_density_humidity_and_wavelength(
         }
     )
     extinction = build.calculate_extinction(
-        aerosol_data, curves, wavelengths, wavelength_nm=550
+        aerosol_data, profiles, wavelengths, wavelength_nm=550
     )
     expected = len(ratios) * 1e-8 * 1.2 * 2
     assert_allclose(extinction, np.full(2, expected))
+
+
+def test_merra_height_conversion_and_geoid_interpolation():
+    latitude = np.array([0.0, 45.0])
+    geopotential_height = np.array([10000.0, 10000.0])
+    latitude_rad = np.deg2rad(2 * latitude)
+    equatorial_radius = 6_378_137.0
+    polar_radius = equatorial_radius * (1 - 1 / 298.257223563)
+    earth_radius = np.sqrt(
+        1
+        / (
+            np.cos(np.deg2rad(latitude)) ** 2 / equatorial_radius**2
+            + np.sin(np.deg2rad(latitude)) ** 2 / polar_radius**2
+        )
+    )
+    gravity_ratio = (
+        1 - 0.002637 * np.cos(latitude_rad) + 0.0000059 * np.cos(latitude_rad) ** 2
+    )
+    expected_height = (
+        geopotential_height
+        * earth_radius
+        / (gravity_ratio * earth_radius - geopotential_height)
+    )
+    assert_allclose(
+        build._geopotential_to_geometric_height(geopotential_height, latitude),
+        expected_height,
+    )
+
+    geoid = xr.DataArray(
+        [[0.0, 10.0], [20.0, 30.0]],
+        coords={"lat": [0.0, 10.0], "lon": [0.0, 10.0]},
+        dims=("lat", "lon"),
+    )
+    offsets = build._interpolate_geoid_undulation(
+        geoid, np.array([5.0]), np.array([5.0])
+    )
+    assert_allclose(offsets, [[15.0]])
 
 
 def test_smoke_test_reads_and_processes_one_column(optics_root, monkeypatch):
@@ -470,12 +507,18 @@ def test_area_weighted_reservoir_keeps_representative_profiles():
 
 
 def test_builder_rejects_incomplete_local_source(tmp_path):
+    geoid_undulation = xr.DataArray(
+        np.zeros((2, 2)),
+        coords={"lat": [-90.0, 90.0], "lon": [0.0, 360.0]},
+        dims=("lat", "lon"),
+    )
     with pytest.raises(FileNotFoundError, match="Local MERRA2 inputs are incomplete"):
         build._process_month(
             1,
             2026,
             2026,
             tmp_path,
+            geoid_undulation,
             {},
             np.array([550.0]),
             1000,

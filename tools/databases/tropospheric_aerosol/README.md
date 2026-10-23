@@ -46,20 +46,6 @@ chmod 600 ~/.netrc
 Do not commit or share the credential file. Test the environment and access
 with the one-day smoke job before submitting the longer yearly build.
 
-For GES DISC authentication, configure Earthdata Login credentials in
-`~/.netrc` on the cluster and restrict its permissions:
-
-```text
-machine urs.earthdata.nasa.gov login YOUR_EARTHDATA_USERNAME password YOUR_EARTHDATA_PASSWORD
-```
-
-```bash
-chmod 600 ~/.netrc
-```
-
-Do not commit or share the credential file. Test the environment and access
-with the one-day smoke job before submitting the longer yearly build.
-
 For the first DRAC Slurm test, submit one complete year (2024 by default) with
 the optical tables available on the cluster:
 
@@ -116,14 +102,20 @@ The five required optical files are:
 - `optics_SS.v3_3.nc`
 - `optics_SU.v1_3.nc`
 
-The component-to-bin mapping, mass-mixing-ratio conversion, relative-humidity
-interpolation, and `bext` use follow
-`sasktran-accel/scripts/monthly_tropospheric_aerosol.py`. Extinction is
-integrated over hydrostatic model-layer thickness where `PL >= TROPPB`.
-Individual columns are area-weighted by cosine latitude. A deterministic
-weighted reservoir bounds memory while estimating the monthly percentile
-windows; the seed, reservoir size, candidate counts, and selected source
-columns are recorded in the build report.
+The builder maps aerosol species to optical bins using the MERRA2 optical
+property tables, then applies the mass-mixing-ratio conversion, relative-
+humidity interpolation, and `bext` calculations. Extinction is integrated
+over hydrostatic model-layer thickness where `PL >= TROPPB`. Individual
+columns are area-weighted by cosine latitude. A deterministic weighted
+reservoir bounds memory while estimating monthly percentile windows; the seed,
+reservoir size, candidate counts, and selected source columns are recorded in
+the build report.
+
+MERRA2 `H` and `PHIS` are geopotential quantities. The builder converts their
+heights to geometric height using latitude-dependent Earth radius and gravity,
+then adds EGM2008 geoid undulation to express them above the WGS84 ellipsoid.
+The EGM2008 grid is obtained through SASKTRAN2's standard database; the first
+build may need network access to retrieve it.
 
 The tool writes `tropospheric_aerosol_v1.nc` and `build_report_v1.json`. Review
 the report, selected profiles, and spectral calculations before shipping the

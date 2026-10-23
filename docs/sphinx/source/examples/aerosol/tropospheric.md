@@ -73,8 +73,11 @@ aerosol.scenarios(month=10)[
 ```
 
 The profile helper returns extinction on its packaged altitude grid or
-interpolates to a caller-provided grid. It does not extend aerosol above the
-tropopause. To add it to an atmosphere, pass an optical property that supplies
+interpolates to a caller-provided grid. Profile altitudes are geometric heights
+above the WGS84 ellipsoid: MERRA2 geopotential heights are converted using
+latitude-dependent gravity and Earth radius, then offset by EGM2008 geoid
+undulation. The profile does not extend aerosol above the tropopause. To add it
+to an atmosphere, pass an optical property that supplies
 the wavelength-dependent scattering and phase information:
 
 ```python
