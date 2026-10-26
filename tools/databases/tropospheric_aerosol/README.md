@@ -114,8 +114,10 @@ the build report.
 MERRA2 `H` and `PHIS` are geopotential quantities. The builder converts their
 heights to geometric height using latitude-dependent Earth radius and gravity,
 then adds EGM2008 geoid undulation to express them above the WGS84 ellipsoid.
-The EGM2008 grid is obtained through SASKTRAN2's standard database; the first
-build may need network access to retrieve it.
+The EGM2008 grid is part of the SASKTRAN2 standard database. On first build,
+the builder downloads the grid directly from the public database URL and caches
+it under `/home/tww275/.local/share/sasktran2/database`. The builder does not
+need the SASKTRAN2 Python package installed in its build environment.
 
 The tool writes `tropospheric_aerosol_v1.nc` and `build_report_v1.json`. Review
 the report, selected profiles, and spectral calculations before shipping the

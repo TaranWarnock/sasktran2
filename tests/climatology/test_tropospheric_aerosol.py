@@ -296,6 +296,33 @@ def test_merra_height_conversion_and_geoid_interpolation():
     assert_allclose(offsets, [[15.0]])
 
 
+def test_geoid_grid_is_downloaded_and_cached(tmp_path, monkeypatch):
+    cache_path = tmp_path / "cache" / "EGM2008_MERRA2.nc"
+    geoid = xr.DataArray(
+        [[1.0, 2.0], [3.0, 4.0]],
+        coords={"lat": [-90.0, 90.0], "lon": [0.0, 360.0]},
+        dims=("lat", "lon"),
+        name="geoid_undulation",
+    )
+    downloads = []
+
+    def download(url, destination):
+        downloads.append((url, Path(destination)))
+        geoid.to_netcdf(destination, engine="scipy")
+
+    monkeypatch.setattr(build, "_geoid_cache_path", lambda: cache_path)
+    monkeypatch.setattr(build, "urlretrieve", download)
+
+    first = build._load_geoid_undulation()
+    second = build._load_geoid_undulation()
+
+    assert len(downloads) == 1
+    assert downloads[0][0] == build._EGM2008_DATABASE_URL
+    assert cache_path.is_file()
+    assert_allclose(first, geoid.sortby("lat").sortby("lon"))
+    assert_allclose(second, first)
+
+
 def test_smoke_test_reads_and_processes_one_column(optics_root, monkeypatch):
     timestamps = np.array(
         ["2024-01-01T00:00:00", "2024-01-01T03:00:00"],

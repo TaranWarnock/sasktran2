@@ -15,15 +15,16 @@ import importlib
 import json
 import logging
 import random
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import MethodType
+from urllib.request import urlretrieve
 
 import numpy as np
-import sasktran2 as sk
 import xarray as xr
 
 _MONTHS = (1, 4, 7, 10)
@@ -59,6 +60,10 @@ _GAS_CONSTANT_DRY_AIR = 287.05
 _STANDARD_GRAVITY = 9.80665
 _GES_DISC_ROOT = "https://data.gesdisc.earthdata.nasa.gov/data/MERRA2"
 _EGM2008_DATABASE_KEY = "geodesy/EGM2008/EGM2008_MERRA2.nc"
+_EGM2008_DATABASE_URL = (
+    "https://arg.usask.ca/sasktranfiles/sasktran2_db/v_latest/"
+    f"{_EGM2008_DATABASE_KEY}"
+)
 _PRODUCTS = {
     "aerosol": ("M2I3NVAER", "inst3_3d_aer_Nv"),
     "meteorology": ("M2I3NVASM", "inst3_3d_asm_Nv"),
@@ -85,16 +90,38 @@ def _required_units(data: xr.Dataset, variable: str, units: str) -> None:
         raise ValueError(msg)
 
 
-def _load_geoid_undulation() -> xr.DataArray:
-    path = sk.database.StandardDatabase().path(_EGM2008_DATABASE_KEY)
-    if path is None or not path.is_file():
-        msg = f"Unable to load EGM2008 geoid undulation grid: {path}"
-        raise FileNotFoundError(msg)
+def _geoid_cache_path() -> Path:
+    return (
+        Path("/home/tww275/.local/share/sasktran2/database")
+        / _EGM2008_DATABASE_KEY
+    )
+
+
+def _read_geoid_undulation(path: Path) -> xr.DataArray:
     with xr.open_dataarray(path) as data:
         if not {"lat", "lon"} <= set(data.coords):
             msg = "EGM2008 grid must have lat and lon coordinates"
             raise ValueError(msg)
         return data.load().sortby("lat").sortby("lon")
+
+
+def _load_geoid_undulation() -> xr.DataArray:
+    path = _geoid_cache_path()
+    if path.is_file():
+        return _read_geoid_undulation(path)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False
+    ) as temporary_file:
+        temporary_path = Path(temporary_file.name)
+    try:
+        urlretrieve(_EGM2008_DATABASE_URL, temporary_path)
+        geoid_undulation = _read_geoid_undulation(temporary_path)
+        temporary_path.replace(path)
+        return geoid_undulation
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 def _interpolate_geoid_undulation(
