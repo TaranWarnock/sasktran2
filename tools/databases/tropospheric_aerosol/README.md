@@ -71,8 +71,19 @@ under `~/scratch/output/sasktran/smoke-YYYY-MM-DD` by default. Change
 
 The job uses four concurrent month workers and streams GES DISC granules
 directly. Transient HTTP failures (429 and common 5xx responses, connection
-errors, and timeouts) get up to five attempts with backoff; persistent
-failures stop the job with the original exception. Set `START_YEAR` and
+errors, and timeouts) get up to five attempts with backoff. If a GES DISC
+range request returns 403, the builder resolves a fresh signed URL and retries
+the range request. Persistent failures stop the job with the original
+exception. After each fully processed day, the builder atomically saves the
+month workers' weighted-reservoir state under
+`OUTPUT_DIR/.checkpoints/<build-id>/`. If the job fails, resubmit with the same
+`OUTPUT_DIR`, year range, seed, reservoir size, optical tables, and data
+source; the builder resumes each month after its last checkpointed day.
+Checkpoints are deleted after the catalogue and report are written
+successfully. They are stored in the output directory, so choose a persistent
+scratch location rather than `$SLURM_TMPDIR`.
+
+Set `START_YEAR` and
 `END_YEAR` to change the period, and set
 `OUTPUT_DIR` to choose where the catalogue and build report are written. For
 example, a complete-history run can be submitted with

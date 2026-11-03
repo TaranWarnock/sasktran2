@@ -14,6 +14,7 @@ import hashlib
 import importlib
 import json
 import logging
+import os
 import random
 import tempfile
 import time
@@ -70,6 +71,19 @@ _PRODUCTS = {
     "tropopause": ("M2I1NXASM", "inst1_2d_asm_Nx"),
 }
 _OPTICS_FILES = tuple(sorted({filename for filename, _ in _COMPONENTS.values()}))
+_RESERVOIR_ARRAY_FIELDS = (
+    "keys",
+    "aod",
+    "profiles",
+    "latitude",
+    "longitude",
+    "time",
+    "time_index",
+    "latitude_index",
+    "longitude_index",
+    "tropopause_altitude",
+    "surface_altitude",
+)
 
 
 def _sha256(path: Path) -> str:
@@ -402,15 +416,37 @@ def _open_granule(location: Path | str):
                             asyncio.TimeoutError,
                             OSError,
                         ) as exc:
-                            if not retryable(exc) or attempt == 4:
-                                raise
-                            delay = retry_delay(attempt)
-                            logging.warning(
-                                "Transient GES DISC range failure (%s); "
-                                "retrying in %.1f s",
-                                type(exc).__name__,
-                                delay,
+                            expired_redirect = (
+                                isinstance(exc, aiohttp.ClientResponseError)
+                                and exc.status == 403
                             )
+                            if (
+                                (not retryable(exc) and not expired_redirect)
+                                or attempt == 4
+                            ):
+                                raise
+                            if expired_redirect:
+                                try:
+                                    info = await _file.fs._info(location)
+                                except Exception as refresh_error:
+                                    raise exc from refresh_error
+                                refreshed_url = info.get("url")
+                                if not refreshed_url:
+                                    raise exc
+                                _file.url = refreshed_url
+                                logging.warning(
+                                    "GES DISC range request returned HTTP 403; "
+                                    "refreshed the signed URL"
+                                )
+                            else:
+                                logging.warning(
+                                    "Transient GES DISC range failure (%s); "
+                                    "retrying",
+                                    type(exc).__name__,
+                                )
+                            delay = retry_delay(attempt)
+                            if not expired_redirect:
+                                logging.warning("Retrying in %.1f s", delay)
                             attempt += 1
                             await asyncio.sleep(delay)
                     msg = "HTTP range retry loop exited unexpectedly"
@@ -869,6 +905,117 @@ def _read_column_spectrum(
     return target
 
 
+def _save_month_checkpoint(
+    path: Path,
+    month: int,
+    checkpoint_config: dict,
+    last_completed_day: date,
+    rng: np.random.Generator,
+    reservoirs: dict[str, _WeightedReservoir],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    metadata = {
+        "schema_version": 1,
+        "month": month,
+        "checkpoint_config": checkpoint_config,
+        "last_completed_day": last_completed_day.isoformat(),
+        "rng_state": rng.bit_generator.state,
+        "valid_candidates": {
+            band: reservoir.valid_candidates for band, reservoir in reservoirs.items()
+        },
+    }
+    arrays = {
+        f"{band}_{field}": getattr(reservoir, field)
+        for band, reservoir in reservoirs.items()
+        for field in _RESERVOIR_ARRAY_FIELDS
+    }
+    arrays["metadata"] = np.asarray(json.dumps(metadata, sort_keys=True))
+
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", dir=path.parent, prefix=f".{path.name}.", suffix=".tmp",
+            delete=False
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+            np.savez_compressed(temporary_file, **arrays)
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
+        temporary_path.replace(path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def _load_month_checkpoint(
+    path: Path,
+    month: int,
+    checkpoint_config: dict,
+    start_year: int,
+    end_year: int,
+    rng: np.random.Generator,
+    reservoirs: dict[str, _WeightedReservoir],
+) -> date | None:
+    if not path.is_file():
+        return None
+
+    try:
+        with np.load(path, allow_pickle=False) as checkpoint:
+            metadata = json.loads(str(checkpoint["metadata"].item()))
+            if metadata.get("schema_version") != 1:
+                msg = f"Unsupported checkpoint schema in {path}"
+                raise ValueError(msg)
+            if metadata.get("month") != month:
+                msg = f"Checkpoint month does not match {month:02d}: {path}"
+                raise ValueError(msg)
+            if metadata.get("checkpoint_config") != checkpoint_config:
+                msg = (
+                    f"Checkpoint settings do not match this build: {path}. "
+                    "Use the same years, optics, and input source, or remove "
+                    "the stale checkpoint."
+                )
+                raise ValueError(msg)
+
+            last_completed_day = date.fromisoformat(metadata["last_completed_day"])
+            if (
+                last_completed_day.month != month
+                or not start_year <= last_completed_day.year <= end_year
+            ):
+                msg = f"Checkpoint date is outside the requested build: {path}"
+                raise ValueError(msg)
+            for band, reservoir in reservoirs.items():
+                fields = {
+                    field: checkpoint[f"{band}_{field}"].copy()
+                    for field in _RESERVOIR_ARRAY_FIELDS
+                }
+                sample_count = len(fields["keys"])
+                if (
+                    sample_count > reservoir.capacity
+                    or fields["profiles"].shape
+                    != (sample_count, len(_TARGET_ALTITUDES_M))
+                    or any(
+                        len(values) != sample_count
+                        for name, values in fields.items()
+                        if name != "profiles"
+                    )
+                ):
+                    msg = f"Invalid reservoir arrays in checkpoint: {path}"
+                    raise ValueError(msg)
+                for field, values in fields.items():
+                    setattr(reservoir, field, values)
+                valid_candidates = metadata["valid_candidates"][band]
+                if valid_candidates < sample_count:
+                    msg = f"Invalid candidate count in checkpoint: {path}"
+                    raise ValueError(msg)
+                reservoir.valid_candidates = int(valid_candidates)
+            rng.bit_generator.state = metadata["rng_state"]
+    except (KeyError, OSError, json.JSONDecodeError) as exc:
+        msg = f"Unable to read MERRA2 checkpoint {path}"
+        raise ValueError(msg) from exc
+
+    return last_completed_day
+
+
 def _process_month(
     month: int,
     start_year: int,
@@ -879,6 +1026,8 @@ def _process_month(
     wavelengths_nm: np.ndarray,
     reservoir_size: int,
     seed: int,
+    checkpoint_path: Path | None = None,
+    checkpoint_config: dict | None = None,
 ) -> list[dict]:
     rng = np.random.default_rng(seed + month)
     reservoirs = {band: _WeightedReservoir(reservoir_size, rng) for band in _BANDS}
@@ -886,9 +1035,38 @@ def _process_month(
         calendar.monthrange(year, month)[1] for year in range(start_year, end_year + 1)
     )
     processed_days = 0
+    last_completed_day = None
+    if checkpoint_path is not None:
+        if checkpoint_config is None:
+            msg = "checkpoint_config is required when checkpointing is enabled"
+            raise ValueError(msg)
+        last_completed_day = _load_month_checkpoint(
+            checkpoint_path,
+            month,
+            checkpoint_config,
+            start_year,
+            end_year,
+            rng,
+            reservoirs,
+        )
+        if last_completed_day is not None:
+            processed_days = sum(
+                calendar.monthrange(year, month)[1]
+                for year in range(start_year, last_completed_day.year)
+            ) + last_completed_day.day
+            logging.info(
+                "Resuming MERRA2 month %02d after %s (%d/%d days complete)",
+                month,
+                last_completed_day.isoformat(),
+                processed_days,
+                total_days,
+            )
     for year in range(start_year, end_year + 1):
         day = date(year, month, 1)
         while day.month == month:
+            if last_completed_day is not None and day <= last_completed_day:
+                day += timedelta(days=1)
+                continue
             locations = {
                 product: _file_for_product(product, day, data_root)
                 for product in _PRODUCTS
@@ -996,6 +1174,15 @@ def _process_month(
                             time_index,
                             latitude_indices,
                         )
+            if checkpoint_path is not None:
+                _save_month_checkpoint(
+                    checkpoint_path,
+                    month,
+                    checkpoint_config,
+                    day,
+                    rng,
+                    reservoirs,
+                )
             processed_days += 1
             logging.info(
                 "MERRA2 month %02d progress: %d/%d days complete (last: %s)",
@@ -1080,6 +1267,22 @@ def build_catalogue(
     workers = int(workers)
     efficiencies, wavelengths_nm = load_efficiency_profiles(optics_root)
     geoid_undulation = _load_geoid_undulation()
+    optical_digests = {
+        filename: _sha256(optics_root / filename) for filename in _OPTICS_FILES
+    }
+    checkpoint_config = {
+        "start_year": start_year,
+        "end_year": end_year,
+        "reservoir_size": reservoir_size,
+        "seed": seed,
+        "data_root": None if data_root is None else str(data_root.resolve()),
+        "optical_tables_sha256": optical_digests,
+        "geoid_sha256": _sha256(_geoid_cache_path()),
+    }
+    checkpoint_id = hashlib.sha256(
+        json.dumps(checkpoint_config, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:16]
+    checkpoint_dir = output / ".checkpoints" / checkpoint_id
     month_arguments = [
         (
             month,
@@ -1091,6 +1294,8 @@ def build_catalogue(
             wavelengths_nm,
             reservoir_size,
             seed,
+            checkpoint_dir / f"month_{month:02d}.npz",
+            checkpoint_config,
         )
         for month in _MONTHS
     ]
@@ -1233,9 +1438,6 @@ def build_catalogue(
         catalogue_path,
         encoding={"extinction_per_m": {"zlib": True, "complevel": 4}},
     )
-    optical_digests = {
-        filename: _sha256(optics_root / filename) for filename in _OPTICS_FILES
-    }
     report = {
         "catalogue_sha256": _sha256(catalogue_path),
         "catalogue_size_bytes": catalogue_path.stat().st_size,
@@ -1260,6 +1462,12 @@ def build_catalogue(
         catalogue_path.stat().st_size,
         report["catalogue_sha256"],
     )
+    for month in _MONTHS:
+        (checkpoint_dir / f"month_{month:02d}.npz").unlink(missing_ok=True)
+    try:
+        checkpoint_dir.rmdir()
+    except OSError as exc:
+        logging.warning("Unable to remove checkpoint directory %s: %s", checkpoint_dir, exc)
     return catalogue_path
 
 

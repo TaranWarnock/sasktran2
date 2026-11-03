@@ -11,7 +11,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import xarray as xr
-from numpy.testing import assert_allclose
+from numpy.testing import assert_allclose, assert_array_equal
 from sasktran2.climatology import tropospheric_aerosol as aerosol
 from sasktran2.optical.base import OpticalProperty, OpticalQuantities
 
@@ -438,7 +438,9 @@ def test_smoke_test_reads_and_processes_one_column(optics_root, monkeypatch):
     assert result["tropospheric_aod_550nm_min"] > 0
 
 
-def test_remote_granule_retries_transient_http_failures(tmp_path):
+def test_remote_granule_retries_transient_failures_and_refreshes_expired_url(
+    tmp_path,
+):
     pytest.importorskip("aiohttp")
     pytest.importorskip("h5netcdf")
     netcdf_path = tmp_path / "remote.nc"
@@ -446,24 +448,40 @@ def test_remote_granule_retries_transient_http_failures(tmp_path):
         netcdf_path, engine="h5netcdf"
     )
     content = netcdf_path.read_bytes()
-    requests = {"head": 0, "get": 0}
+    requests = {"head": 0, "get": 0, "signed_head": 0, "signed_get": 0}
 
     class Handler(BaseHTTPRequestHandler):
         def do_HEAD(self):
-            requests["head"] += 1
-            if requests["head"] == 1:
-                self.send_error(503)
-                return
+            if self.path.startswith("/signed"):
+                requests["signed_head"] += 1
+            else:
+                requests["head"] += 1
+                if requests["head"] == 1:
+                    self.send_error(503)
+                    return
+                if requests["head"] == 3:
+                    self.send_response(302)
+                    self.send_header(
+                        "Location", f"http://127.0.0.1:{self.server.server_port}/signed"
+                    )
+                    self.end_headers()
+                    return
             self.send_response(200)
             self.send_header("Content-Length", str(len(content)))
             self.send_header("Accept-Ranges", "bytes")
             self.end_headers()
 
         def do_GET(self):
-            requests["get"] += 1
-            if requests["get"] == 1:
-                self.send_error(503)
-                return
+            if self.path.startswith("/signed"):
+                requests["signed_get"] += 1
+            else:
+                requests["get"] += 1
+                if requests["get"] == 1:
+                    self.send_error(503)
+                    return
+                if requests["get"] == 2:
+                    self.send_error(403)
+                    return
             start, end = map(
                 int, self.headers["Range"].removeprefix("bytes=").split("-")
             )
@@ -488,7 +506,7 @@ def test_remote_granule_retries_transient_http_failures(tmp_path):
         ) as dataset:
             result = dataset["sample"].load().values
         assert_allclose(result, np.arange(4, dtype=np.float32))
-        assert requests == {"head": 2, "get": 2}
+        assert requests == {"head": 3, "get": 2, "signed_head": 1, "signed_get": 1}
     finally:
         server.shutdown()
         server.server_close()
@@ -531,6 +549,101 @@ def test_area_weighted_reservoir_keeps_representative_profiles():
     assert 47 <= percentile <= 53
     assert count > 0
     assert lower <= reservoir.aod[index] <= upper
+
+
+def test_month_checkpoint_restores_reservoir_and_skips_completed_days(
+    tmp_path, monkeypatch
+):
+    month = 1
+    config = {"start_year": 2024, "end_year": 2024, "seed": 42}
+    checkpoint_path = tmp_path / "checkpoints" / "month_01.npz"
+    rng = np.random.default_rng(43)
+    reservoirs = {
+        band: build._WeightedReservoir(1000, rng) for band in build._BANDS
+    }
+    for reservoir in reservoirs.values():
+        reservoir.keys = np.linspace(-1.0, -0.01, 1000)
+        reservoir.aod = np.linspace(0.01, 1.0, 1000)
+        reservoir.profiles = np.ones((1000, len(build._TARGET_ALTITUDES_M)))
+        reservoir.latitude = np.full(1000, 0.0)
+        reservoir.longitude = np.full(1000, 180.0)
+        reservoir.time = np.full(1000, np.datetime64("2024-01-01"))
+        reservoir.time_index = np.zeros(1000, dtype=np.int16)
+        reservoir.latitude_index = np.zeros(1000, dtype=np.int16)
+        reservoir.longitude_index = np.zeros(1000, dtype=np.int16)
+        reservoir.tropopause_altitude = np.full(1000, 12000.0)
+        reservoir.surface_altitude = np.zeros(1000)
+        reservoir.valid_candidates = 1000
+
+    build._save_month_checkpoint(
+        checkpoint_path,
+        month,
+        config,
+        build.date(2024, 1, 31),
+        rng,
+        reservoirs,
+    )
+    expected_random = rng.random(3)
+
+    with pytest.raises(ValueError, match="Checkpoint settings do not match"):
+        build._load_month_checkpoint(
+            checkpoint_path,
+            month,
+            {**config, "seed": 43},
+            2024,
+            2024,
+            np.random.default_rng(0),
+            {},
+        )
+
+    resumed_rng = np.random.default_rng(0)
+    resumed_reservoirs = {
+        band: build._WeightedReservoir(1000, resumed_rng) for band in build._BANDS
+    }
+    last_completed_day = build._load_month_checkpoint(
+        checkpoint_path,
+        month,
+        config,
+        2024,
+        2024,
+        resumed_rng,
+        resumed_reservoirs,
+    )
+    assert last_completed_day == build.date(2024, 1, 31)
+    assert_allclose(resumed_rng.random(3), expected_random)
+    for band in build._BANDS:
+        assert_allclose(resumed_reservoirs[band].aod, reservoirs[band].aod)
+        assert_array_equal(resumed_reservoirs[band].time, reservoirs[band].time)
+
+    def unexpected_source_read(*_args, **_kwargs):
+        pytest.fail("A completed month checkpoint should not reread MERRA2 data")
+
+    monkeypatch.setattr(build, "_open_granule", unexpected_source_read)
+    monkeypatch.setattr(
+        build,
+        "_read_column_spectrum",
+        lambda *_args, **_kwargs: np.ones(
+            (len(build._TARGET_ALTITUDES_M), 1)
+        ),
+    )
+    records = build._process_month(
+        month,
+        2024,
+        2024,
+        None,
+        xr.DataArray(
+            np.zeros((2, 2)),
+            coords={"lat": [-90.0, 90.0], "lon": [0.0, 360.0]},
+            dims=("lat", "lon"),
+        ),
+        {},
+        np.array([550.0]),
+        1000,
+        42,
+        checkpoint_path,
+        config,
+    )
+    assert len(records) == len(build._BANDS) * len(build._TIERS)
 
 
 def test_builder_rejects_incomplete_local_source(tmp_path):
