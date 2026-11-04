@@ -323,6 +323,101 @@ def test_geoid_grid_is_downloaded_and_cached(tmp_path, monkeypatch):
     assert_allclose(second, first)
 
 
+def test_geoid_cache_path_follows_sasktran2_database_root(tmp_path, monkeypatch):
+    monkeypatch.setenv("SASKTRAN2_DATABASE_ROOT", str(tmp_path / "db"))
+    assert build._geoid_cache_path() == (tmp_path / "db" / build._EGM2008_DATABASE_KEY)
+
+    monkeypatch.delenv("SASKTRAN2_DATABASE_ROOT")
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    assert build._geoid_cache_path() == (
+        tmp_path / "xdg" / "sasktran2" / "database" / build._EGM2008_DATABASE_KEY
+    )
+
+    monkeypatch.delenv("XDG_DATA_HOME")
+    monkeypatch.setattr(build.Path, "home", lambda: tmp_path / "home")
+    assert build._geoid_cache_path() == (
+        tmp_path
+        / "home"
+        / ".local"
+        / "share"
+        / "sasktran2"
+        / "database"
+        / build._EGM2008_DATABASE_KEY
+    )
+
+
+@pytest.mark.parametrize(
+    ("day", "stream"),
+    [
+        ((1991, 12, 31), 100),
+        ((1992, 1, 1), 200),
+        ((2001, 1, 1), 300),
+        ((2011, 1, 1), 400),
+        ((2020, 8, 31), 400),
+        ((2020, 9, 1), 401),
+        ((2020, 9, 30), 401),
+        ((2020, 10, 1), 400),
+        ((2021, 5, 31), 400),
+        ((2021, 6, 1), 401),
+        ((2021, 9, 30), 401),
+        ((2021, 10, 1), 400),
+        ((2024, 7, 1), 400),
+    ],
+)
+def test_collection_number_uses_reprocessed_401_stream(day, stream):
+    assert build._collection_number(build.date(*day)) == stream
+
+
+def test_month_days_cover_only_the_requested_month_in_each_year():
+    days = build._month_days(1, 2023, 2024)
+    assert len(days) == 62
+    assert days[0] == build.date(2023, 1, 1)
+    assert days[30] == build.date(2023, 1, 31)
+    assert days[31] == build.date(2024, 1, 1)
+    assert all(day.month == 1 for day in days)
+    assert len(build._month_days(2, 2023, 2024)) == 28 + 29
+
+
+def test_multi_year_month_skips_days_outside_the_month(tmp_path, monkeypatch):
+    opened_days = []
+
+    class _Stop(Exception):
+        pass
+
+    @contextmanager
+    def record_day(day, *_args, **_kwargs):
+        opened_days.append(day)
+        if len(opened_days) > 31:
+            raise _Stop
+        yield (
+            {},
+            xr.Dataset(coords={"lat": [0.0], "time": np.array([], "M8[ns]")}),
+            None,
+            xr.Dataset(coords={"time": np.array([], "M8[ns]")}),
+        )
+
+    monkeypatch.setattr(build, "_open_daily_granules", record_day)
+    monkeypatch.setattr(build, "_validate_inputs", lambda *_args: None)
+    with pytest.raises(_Stop):
+        build._process_month(
+            1,
+            2023,
+            2024,
+            tmp_path,
+            xr.DataArray(
+                np.zeros((2, 2)),
+                coords={"lat": [-90.0, 90.0], "lon": [0.0, 360.0]},
+                dims=("lat", "lon"),
+            ),
+            {},
+            np.array([550.0]),
+            1000,
+            42,
+        )
+    assert opened_days[30] == build.date(2023, 1, 31)
+    assert opened_days[31] == build.date(2024, 1, 1)
+
+
 def test_smoke_test_reads_and_processes_one_column(optics_root, monkeypatch):
     timestamps = np.array(
         ["2024-01-01T00:00:00", "2024-01-01T03:00:00"],
@@ -813,6 +908,89 @@ def test_month_checkpoint_restores_reservoir_and_skips_completed_days(
         config,
     )
     assert len(records) == len(build._BANDS) * len(build._TIERS)
+
+
+def test_multi_year_checkpoint_validates_only_days_in_the_month(tmp_path, monkeypatch):
+    month = 1
+    config = {
+        "algorithm_version": build._CHECKPOINT_ALGORITHM_VERSION,
+        "start_year": 2023,
+        "end_year": 2024,
+        "seed": 42,
+    }
+    completed_days = [
+        *(build.date(2023, 1, day) for day in range(1, 32)),
+        *(build.date(2024, 1, day) for day in range(1, 3)),
+    ]
+    source_identities = {
+        day.isoformat(): {
+            product: {"kind": "remote", "url": str(product), "size": 1}
+            for product in build._PRODUCTS
+        }
+        for day in completed_days
+    }
+    checked_days = []
+    monkeypatch.setattr(
+        build,
+        "_source_locations",
+        lambda day, _data_root: (
+            checked_days.append(day)
+            or {product: (day, product) for product in build._PRODUCTS}
+        ),
+    )
+    monkeypatch.setattr(
+        build,
+        "_source_identity",
+        lambda location: source_identities[location[0].isoformat()][location[1]],
+    )
+    rng = np.random.default_rng(1)
+    build._save_month_checkpoint(
+        tmp_path / "month_01.npz",
+        month,
+        config,
+        completed_days[-1],
+        rng,
+        {},
+        source_identities,
+    )
+    last_completed_day, _ = build._load_month_checkpoint(
+        tmp_path / "month_01.npz",
+        month,
+        config,
+        2023,
+        2024,
+        None,
+        np.random.default_rng(0),
+        {},
+    )
+    assert last_completed_day == build.date(2024, 1, 2)
+    assert checked_days == completed_days
+
+    # A checkpoint written by the old loop also holds days outside the month.
+    stale_identities = {
+        **source_identities,
+        "2023-02-01": source_identities["2023-01-01"],
+    }
+    build._save_month_checkpoint(
+        tmp_path / "month_01.npz",
+        month,
+        config,
+        completed_days[-1],
+        rng,
+        {},
+        stale_identities,
+    )
+    with pytest.raises(ValueError, match="days outside the requested month"):
+        build._load_month_checkpoint(
+            tmp_path / "month_01.npz",
+            month,
+            config,
+            2023,
+            2024,
+            None,
+            np.random.default_rng(0),
+            {},
+        )
 
 
 def test_builder_rejects_incomplete_local_source(tmp_path, caplog):

@@ -20,7 +20,7 @@ import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from functools import partial
 from pathlib import Path
 from types import MethodType
@@ -161,10 +161,15 @@ def _required_units(data: xr.Dataset, variable: str, units: str) -> None:
 
 
 def _geoid_cache_path() -> Path:
-    return (
-        Path("/home/tww275/.local/share/sasktran2/database")
-        / _EGM2008_DATABASE_KEY
-    )
+    # Follows the SASKTRAN2_DATABASE_ROOT override and Linux default of
+    # sasktran2.appconfig.database_root() without importing sasktran2, which is
+    # not installed in the Slurm build environment. The user config.yml and
+    # appdirs macOS/Windows locations are not consulted.
+    database_root = os.environ.get("SASKTRAN2_DATABASE_ROOT")
+    if database_root:
+        return Path(database_root) / _EGM2008_DATABASE_KEY
+    data_home = os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share"
+    return Path(data_home) / "sasktran2" / "database" / _EGM2008_DATABASE_KEY
 
 
 def _read_geoid_undulation(path: Path) -> xr.DataArray:
@@ -389,6 +394,11 @@ def calculate_spectral_extinction(
 
 
 def _collection_number(day: date) -> int:
+    # GES DISC reprocessed these periods and publishes them only as stream 401.
+    if date(2020, 9, 1) <= day <= date(2020, 9, 30) or (
+        date(2021, 6, 1) <= day <= date(2021, 9, 30)
+    ):
+        return 401
     if day.year <= 1991:
         return 100
     if day.year <= 2000:
@@ -1165,6 +1175,14 @@ def _save_month_checkpoint(
             temporary_path.unlink(missing_ok=True)
 
 
+def _month_days(month: int, start_year: int, end_year: int) -> list[date]:
+    return [
+        date(year, month, day)
+        for year in range(start_year, end_year + 1)
+        for day in range(1, calendar.monthrange(year, month)[1] + 1)
+    ]
+
+
 def _load_month_checkpoint(
     path: Path,
     month: int,
@@ -1203,15 +1221,26 @@ def _load_month_checkpoint(
                 msg = f"Checkpoint date is outside the requested build: {path}"
                 raise ValueError(msg)
             source_identities = metadata["source_identities"]
-            identity_days = (last_completed_day - date(start_year, month, 1)).days + 1
+            completed_days = [
+                day
+                for day in _month_days(month, start_year, end_year)
+                if day <= last_completed_day
+            ]
+            if set(source_identities) != {day.isoformat() for day in completed_days}:
+                # Checkpoints from the old multi-year loop sampled every
+                # calendar day, not just this month's days.
+                msg = (
+                    f"Checkpoint covers days outside the requested month; "
+                    f"remove the stale checkpoint: {path}"
+                )
+                raise ValueError(msg)
+            identity_days = len(completed_days)
             logging.info(
                 "Validating checkpoint sources for MERRA2 month %02d (%d days)",
                 month,
                 identity_days,
             )
-            day = date(start_year, month, 1)
-            validated_days = 0
-            while day <= last_completed_day:
+            for validated_days, day in enumerate(completed_days, start=1):
                 expected_identities = source_identities.get(day.isoformat())
                 if expected_identities is None:
                     msg = (
@@ -1229,7 +1258,6 @@ def _load_month_checkpoint(
                         f"the stale checkpoint to rebuild: {path}"
                     )
                     raise ValueError(msg)
-                validated_days += 1
                 if validated_days % 10 == 0 or day == last_completed_day:
                     logging.info(
                         "Validated checkpoint sources for MERRA2 month %02d: "
@@ -1239,7 +1267,6 @@ def _load_month_checkpoint(
                         identity_days,
                         day.isoformat(),
                     )
-                day += timedelta(days=1)
             for band, reservoir in reservoirs.items():
                 fields = {
                     field: checkpoint[f"{band}_{field}"].copy()
@@ -1288,11 +1315,10 @@ def _process_month(
 ) -> list[dict]:
     rng = np.random.default_rng(seed + month)
     reservoirs = {band: _WeightedReservoir(reservoir_size, rng) for band in _BANDS}
-    first_day = date(start_year, month, 1)
-    final_day = date(
-        end_year, month, calendar.monthrange(end_year, month)[1]
-    )
-    total_days = (final_day - first_day).days + 1
+    days = _month_days(month, start_year, end_year)
+    first_day = days[0]
+    final_day = days[-1]
+    total_days = len(days)
     processed_days = 0
     last_completed_day = None
     source_identities = {}
@@ -1321,7 +1347,7 @@ def _process_month(
         )
         if checkpoint_state is not None:
             last_completed_day, source_identities = checkpoint_state
-            processed_days = (last_completed_day - first_day).days + 1
+            processed_days = sum(day <= last_completed_day for day in days)
             logging.info(
                 "Resuming MERRA2 month %02d after %s (%d/%d days complete)",
                 month,
@@ -1329,16 +1355,14 @@ def _process_month(
                 processed_days,
                 total_days,
             )
-    day = first_day
-    while day <= final_day:
+    for day_number, day in enumerate(days, start=1):
         if last_completed_day is not None and day <= last_completed_day:
-            day += timedelta(days=1)
             continue
         logging.info(
             "Starting MERRA2 month %02d day %s (%d/%d)",
             month,
             day.isoformat(),
-            (day - first_day).days + 1,
+            day_number,
             total_days,
         )
         with _open_daily_granules(
@@ -1472,7 +1496,6 @@ def _process_month(
             total_days,
             day.isoformat(),
         )
-        day += timedelta(days=1)
 
     result = []
     for band in _BANDS:
