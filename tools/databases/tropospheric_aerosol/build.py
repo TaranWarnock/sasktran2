@@ -21,11 +21,13 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
+from functools import partial
 from pathlib import Path
 from types import MethodType
 from urllib.request import urlretrieve
 
 import numpy as np
+import requests
 import xarray as xr
 
 _MONTHS = (1, 4, 7, 10)
@@ -65,6 +67,7 @@ _EGM2008_DATABASE_URL = (
     "https://arg.usask.ca/sasktranfiles/sasktran2_db/v_latest/"
     f"{_EGM2008_DATABASE_KEY}"
 )
+_CHECKPOINT_ALGORITHM_VERSION = 1
 _PRODUCTS = {
     "aerosol": ("M2I3NVAER", "inst3_3d_aer_Nv"),
     "meteorology": ("M2I3NVASM", "inst3_3d_asm_Nv"),
@@ -92,6 +95,59 @@ def _sha256(path: Path) -> str:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _local_source_identity(path: Path) -> dict:
+    return {
+        "kind": "local",
+        "path": str(path.resolve()),
+        "size": path.stat().st_size,
+        "sha256": _sha256(path),
+    }
+
+
+def _remote_source_identity(location: str, info: dict) -> dict:
+    etag = info.get("ETag") or info.get("etag")
+    last_modified = info.get("Last-Modified") or info.get("last_modified")
+    size = info.get("size")
+    if not etag and (not last_modified or size is None):
+        msg = (
+            "GES DISC did not provide an ETag or a Last-Modified header with "
+            "known size; "
+            f"cannot safely checkpoint source identity for {location}"
+        )
+        raise ValueError(msg)
+    return {
+        "kind": "remote",
+        "url": location,
+        "etag": etag,
+        "last_modified": last_modified,
+        "size": size,
+    }
+
+
+def _source_identity(location: Path | str) -> dict:
+    if isinstance(location, Path):
+        if not location.is_file():
+            msg = f"MERRA2 granule not found: {location}"
+            raise FileNotFoundError(msg)
+        return _local_source_identity(location)
+
+    try:
+        http_module = importlib.import_module("fsspec.implementations.http")
+    except ImportError as exc:
+        msg = "Install fsspec[http] to validate remote MERRA2 checkpoint sources"
+        raise ImportError(msg) from exc
+    filesystem = http_module.HTTPFileSystem(client_kwargs={"trust_env": True})
+    fsspec_async = importlib.import_module("fsspec.asyn")
+    info = fsspec_async.sync(filesystem.loop, filesystem._info, location)
+    return _remote_source_identity(location, info)
+
+
+def _checkpoint_id(checkpoint_config: dict) -> str:
+    return hashlib.sha256(
+        json.dumps(checkpoint_config, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:16]
 
 
 def _required_units(data: xr.Dataset, variable: str, units: str) -> None:
@@ -351,12 +407,17 @@ def _source_location(product: str, day: date, data_root: Path | None) -> Path | 
 
 
 @contextmanager
-def _open_granule(location: Path | str):
+def _open_granule(location: Path | str, identity_callback=None):
+    granule_name = Path(location).name
+    logging.info("Opening MERRA2 granule %s", granule_name)
     if isinstance(location, Path):
         if not location.is_file():
             msg = f"MERRA2 granule not found: {location}"
             raise FileNotFoundError(msg)
+        if identity_callback is not None:
+            identity_callback(_local_source_identity(location))
         with xr.open_dataset(location, engine="h5netcdf") as data:
+            logging.info("Opened MERRA2 granule %s", granule_name)
             yield data
     else:
         try:
@@ -382,6 +443,12 @@ def _open_granule(location: Path | str):
             return min(2**attempt, 30) + random.uniform(0, 1)
 
         class RetryingHTTPFileSystem(http_module.HTTPFileSystem):
+            def info(self, path, **kwargs):
+                result = fsspec_async.sync(self.loop, self._info, path, **kwargs)
+                if identity_callback is not None and path == location:
+                    identity_callback(_remote_source_identity(location, result))
+                return result
+
             def _open(self, *args, **kwargs):
                 for attempt in range(5):
                     try:
@@ -470,7 +537,152 @@ def _open_granule(location: Path | str):
             ) as stream,
             xr.open_dataset(stream, engine="h5netcdf") as data,
         ):
+            logging.info("Opened MERRA2 granule %s", granule_name)
             yield data
+
+
+def _download_granule(location: str, destination: Path) -> None:
+    temporary_path = destination.with_name(f".{destination.name}.part")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    for attempt in range(5):
+        started = time.monotonic()
+        received = 0
+        try:
+            logging.info("Downloading MERRA2 granule %s", Path(location).name)
+            with requests.get(
+                location,
+                headers={"Accept-Encoding": "identity"},
+                stream=True,
+                timeout=(30, 120),
+            ) as response:
+                response.raise_for_status()
+                content_length = response.headers.get("Content-Length")
+                expected_size = int(content_length) if content_length else None
+                with temporary_path.open("wb") as stream:
+                    last_progress = started
+                    for chunk in response.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            stream.write(chunk)
+                            received += len(chunk)
+                            now = time.monotonic()
+                            if now - last_progress >= 60:
+                                if expected_size is None:
+                                    logging.info(
+                                        "MERRA2 download progress %s: %d bytes",
+                                        Path(location).name,
+                                        received,
+                                    )
+                                else:
+                                    logging.info(
+                                        "MERRA2 download progress %s: %.1f%% "
+                                        "(%d/%d bytes)",
+                                        Path(location).name,
+                                        100 * received / expected_size,
+                                        received,
+                                        expected_size,
+                                    )
+                                last_progress = now
+            if expected_size is not None and received != expected_size:
+                msg = (
+                    f"Incomplete download of {location}: received {received} "
+                    f"of {expected_size} bytes"
+                )
+                raise requests.ConnectionError(msg)
+            temporary_path.replace(destination)
+            logging.info(
+                "Downloaded MERRA2 granule %s (%d bytes, %.1f s)",
+                Path(location).name,
+                received,
+                time.monotonic() - started,
+            )
+            return
+        except requests.RequestException as exc:
+            temporary_path.unlink(missing_ok=True)
+            status = (
+                exc.response.status_code
+                if isinstance(exc, requests.HTTPError) and exc.response is not None
+                else None
+            )
+            retryable = status in {429, 500, 502, 503, 504} or status is None
+            if not retryable or attempt == 4:
+                raise
+            delay = min(2**attempt, 30) + random.uniform(0, 1)
+            logging.warning(
+                "Transient MERRA2 download failure (%s); retrying in %.1f s",
+                type(exc).__name__,
+                delay,
+            )
+            time.sleep(delay)
+        except OSError:
+            temporary_path.unlink(missing_ok=True)
+            raise
+
+
+@contextmanager
+def _open_daily_granules(
+    day: date,
+    data_root: Path | None,
+    *,
+    stage_daily: bool,
+    checkpointing: bool,
+):
+    locations = _source_locations(day, data_root)
+    missing_products = [
+        product
+        for product, location in locations.items()
+        if data_root is not None and not Path(location).is_file()
+    ]
+    if missing_products:
+        msg = (
+            f"Local MERRA2 inputs are incomplete for {day}: missing "
+            f"{', '.join(missing_products)}"
+        )
+        raise FileNotFoundError(msg)
+
+    identities = {}
+    if stage_daily and data_root is None:
+        slurm_tmpdir = os.environ.get("SLURM_TMPDIR") or None
+        with tempfile.TemporaryDirectory(
+            prefix=f"sasktran2-merra2-{day:%Y%m%d}-",
+            dir=slurm_tmpdir,
+        ) as temporary_directory:
+            logging.info(
+                "Staging MERRA2 granules for %s in %s",
+                day.isoformat(),
+                temporary_directory,
+            )
+            staged_locations = {}
+            for product, location in locations.items():
+                staged_path = Path(temporary_directory) / Path(location).name
+                if checkpointing:
+                    identities[product] = _source_identity(location)
+                _download_granule(location, staged_path)
+                staged_locations[product] = staged_path
+            with (
+                _open_granule(staged_locations["aerosol"]) as aerosol,
+                _open_granule(staged_locations["meteorology"]) as meteorology,
+                _open_granule(staged_locations["tropopause"]) as tropopause,
+            ):
+                yield identities, aerosol, meteorology, tropopause
+    else:
+        callbacks = (
+            {
+                product: partial(identities.__setitem__, product)
+                for product in _PRODUCTS
+            }
+            if checkpointing
+            else {}
+        )
+        with (
+            _open_granule(locations["aerosol"], callbacks.get("aerosol")) as aerosol,
+            _open_granule(
+                locations["meteorology"], callbacks.get("meteorology")
+            ) as meteorology,
+            _open_granule(
+                locations["tropopause"], callbacks.get("tropopause")
+            ) as tropopause,
+        ):
+            yield identities, aerosol, meteorology, tropopause
 
 
 def _validate_inputs(
@@ -513,9 +725,7 @@ def run_smoke_test(
     data_root: Path | None = None,
 ) -> dict:
     """Read and process a sample column from each MERRA2 product for one day."""
-    locations = {
-        product: _file_for_product(product, day, data_root) for product in _PRODUCTS
-    }
+    locations = _source_locations(day, data_root)
     with (
         _open_granule(locations["aerosol"]) as aerosol,
         _open_granule(locations["meteorology"]) as meteorology,
@@ -825,6 +1035,12 @@ def _file_for_product(
     return _source_location(product, day, data_root)
 
 
+def _source_locations(day: date, data_root: Path | None) -> dict[str, Path | str]:
+    return {
+        product: _file_for_product(product, day, data_root) for product in _PRODUCTS
+    }
+
+
 def _read_column_spectrum(
     day: date,
     time_index: int,
@@ -835,7 +1051,7 @@ def _read_column_spectrum(
     efficiency_profiles: dict[str, tuple[np.ndarray, np.ndarray]],
     wavelengths_nm: np.ndarray,
 ) -> np.ndarray:
-    locations = {name: _file_for_product(name, day, data_root) for name in _PRODUCTS}
+    locations = _source_locations(day, data_root)
     with (
         _open_granule(locations["aerosol"]) as aerosol,
         _open_granule(locations["meteorology"]) as meteorology,
@@ -912,6 +1128,7 @@ def _save_month_checkpoint(
     last_completed_day: date,
     rng: np.random.Generator,
     reservoirs: dict[str, _WeightedReservoir],
+    source_identities: dict[str, dict[str, dict]],
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     metadata = {
@@ -920,6 +1137,7 @@ def _save_month_checkpoint(
         "checkpoint_config": checkpoint_config,
         "last_completed_day": last_completed_day.isoformat(),
         "rng_state": rng.bit_generator.state,
+        "source_identities": source_identities,
         "valid_candidates": {
             band: reservoir.valid_candidates for band, reservoir in reservoirs.items()
         },
@@ -953,9 +1171,10 @@ def _load_month_checkpoint(
     checkpoint_config: dict,
     start_year: int,
     end_year: int,
+    data_root: Path | None,
     rng: np.random.Generator,
     reservoirs: dict[str, _WeightedReservoir],
-) -> date | None:
+) -> tuple[date, dict[str, dict[str, dict]]] | None:
     if not path.is_file():
         return None
 
@@ -970,9 +1189,9 @@ def _load_month_checkpoint(
                 raise ValueError(msg)
             if metadata.get("checkpoint_config") != checkpoint_config:
                 msg = (
-                    f"Checkpoint settings do not match this build: {path}. "
-                    "Use the same years, optics, and input source, or remove "
-                    "the stale checkpoint."
+                    f"Checkpoint settings or algorithm version do not match "
+                    f"this build: {path}. Use matching inputs or remove the "
+                    "stale checkpoint."
                 )
                 raise ValueError(msg)
 
@@ -983,6 +1202,44 @@ def _load_month_checkpoint(
             ):
                 msg = f"Checkpoint date is outside the requested build: {path}"
                 raise ValueError(msg)
+            source_identities = metadata["source_identities"]
+            identity_days = (last_completed_day - date(start_year, month, 1)).days + 1
+            logging.info(
+                "Validating checkpoint sources for MERRA2 month %02d (%d days)",
+                month,
+                identity_days,
+            )
+            day = date(start_year, month, 1)
+            validated_days = 0
+            while day <= last_completed_day:
+                expected_identities = source_identities.get(day.isoformat())
+                if expected_identities is None:
+                    msg = (
+                        f"Checkpoint is missing source identities for {day}; "
+                        f"remove the stale checkpoint: {path}"
+                    )
+                    raise ValueError(msg)
+                actual_identities = {
+                    product: _source_identity(location)
+                    for product, location in _source_locations(day, data_root).items()
+                }
+                if actual_identities != expected_identities:
+                    msg = (
+                        f"MERRA2 source identity changed for {day}; remove "
+                        f"the stale checkpoint to rebuild: {path}"
+                    )
+                    raise ValueError(msg)
+                validated_days += 1
+                if validated_days % 10 == 0 or day == last_completed_day:
+                    logging.info(
+                        "Validated checkpoint sources for MERRA2 month %02d: "
+                        "%d/%d days (last: %s)",
+                        month,
+                        validated_days,
+                        identity_days,
+                        day.isoformat(),
+                    )
+                day += timedelta(days=1)
             for band, reservoir in reservoirs.items():
                 fields = {
                     field: checkpoint[f"{band}_{field}"].copy()
@@ -993,11 +1250,7 @@ def _load_month_checkpoint(
                     sample_count > reservoir.capacity
                     or fields["profiles"].shape
                     != (sample_count, len(_TARGET_ALTITUDES_M))
-                    or any(
-                        len(values) != sample_count
-                        for name, values in fields.items()
-                        if name != "profiles"
-                    )
+                    or any(len(values) != sample_count for values in fields.values())
                 ):
                     msg = f"Invalid reservoir arrays in checkpoint: {path}"
                     raise ValueError(msg)
@@ -1010,10 +1263,13 @@ def _load_month_checkpoint(
                 reservoir.valid_candidates = int(valid_candidates)
             rng.bit_generator.state = metadata["rng_state"]
     except (KeyError, OSError, json.JSONDecodeError) as exc:
-        msg = f"Unable to read MERRA2 checkpoint {path}"
+        msg = (
+            f"Unable to read or validate MERRA2 checkpoint {path}; remove the "
+            "stale or corrupt checkpoint and restart"
+        )
         raise ValueError(msg) from exc
 
-    return last_completed_day
+    return last_completed_day, source_identities
 
 
 def _process_month(
@@ -1028,32 +1284,44 @@ def _process_month(
     seed: int,
     checkpoint_path: Path | None = None,
     checkpoint_config: dict | None = None,
+    stage_daily: bool = False,
 ) -> list[dict]:
     rng = np.random.default_rng(seed + month)
     reservoirs = {band: _WeightedReservoir(reservoir_size, rng) for band in _BANDS}
-    total_days = sum(
-        calendar.monthrange(year, month)[1] for year in range(start_year, end_year + 1)
+    first_day = date(start_year, month, 1)
+    final_day = date(
+        end_year, month, calendar.monthrange(end_year, month)[1]
     )
+    total_days = (final_day - first_day).days + 1
     processed_days = 0
     last_completed_day = None
-    if checkpoint_path is not None:
+    source_identities = {}
+    checkpointing = checkpoint_path is not None
+    logging.info(
+        "Starting MERRA2 month %02d: %s through %s (%d days)",
+        month,
+        first_day.isoformat(),
+        final_day.isoformat(),
+        total_days,
+    )
+    if checkpointing:
         if checkpoint_config is None:
             msg = "checkpoint_config is required when checkpointing is enabled"
             raise ValueError(msg)
-        last_completed_day = _load_month_checkpoint(
+        logging.info("Checking checkpoint for MERRA2 month %02d", month)
+        checkpoint_state = _load_month_checkpoint(
             checkpoint_path,
             month,
             checkpoint_config,
             start_year,
             end_year,
+            data_root,
             rng,
             reservoirs,
         )
-        if last_completed_day is not None:
-            processed_days = sum(
-                calendar.monthrange(year, month)[1]
-                for year in range(start_year, last_completed_day.year)
-            ) + last_completed_day.day
+        if checkpoint_state is not None:
+            last_completed_day, source_identities = checkpoint_state
+            processed_days = (last_completed_day - first_day).days + 1
             logging.info(
                 "Resuming MERRA2 month %02d after %s (%d/%d days complete)",
                 month,
@@ -1061,137 +1329,150 @@ def _process_month(
                 processed_days,
                 total_days,
             )
-    for year in range(start_year, end_year + 1):
-        day = date(year, month, 1)
-        while day.month == month:
-            if last_completed_day is not None and day <= last_completed_day:
-                day += timedelta(days=1)
-                continue
-            locations = {
-                product: _file_for_product(product, day, data_root)
-                for product in _PRODUCTS
-            }
-            if data_root is not None and not all(
-                Path(location).is_file() for location in locations.values()
-            ):
-                missing_products = [
-                    name
-                    for name, location in locations.items()
-                    if not Path(location).is_file()
-                ]
-                msg = (
-                    f"Local MERRA2 inputs are incomplete for {day}: missing "
-                    f"{', '.join(missing_products)}"
-                )
-                raise FileNotFoundError(msg)
-            with (
-                _open_granule(locations["aerosol"]) as aerosol,
-                _open_granule(locations["meteorology"]) as meteorology,
-                _open_granule(locations["tropopause"]) as tropopause,
-            ):
-                _validate_inputs(aerosol, meteorology, tropopause)
-                latitudes = aerosol.lat.values
-                times = aerosol.time.values
-                for time_index, timestamp in enumerate(times):
-                    tropopause_index = np.flatnonzero(
-                        tropopause.time.values == timestamp
-                    )
-                    if tropopause_index.size != 1:
-                        msg = (
-                            f"No exact M2I1NXASM TROPPB sample for {timestamp} in {day}"
-                        )
-                        raise ValueError(msg)
-                    for band, (south, north) in _BANDS.items():
-                        latitude_indices = np.flatnonzero(
-                            (latitudes >= south) & (latitudes <= north)
-                        )
-                        lat_slice = slice(
-                            int(latitude_indices[0]), int(latitude_indices[-1]) + 1
-                        )
-                        aer_part = (
-                            aerosol[_AEROSOL_VARIABLES]
-                            .isel(time=time_index, lat=lat_slice)
-                            .load()
-                        )
-                        met_part = (
-                            meteorology[_METEOROLOGY_VARIABLES]
-                            .isel(time=time_index, lat=lat_slice)
-                            .load()
-                        )
-                        tp_part = tropopause.TROPPB.isel(
-                            time=int(tropopause_index[0]), lat=lat_slice
-                        ).load()
-                        if not np.array_equal(
-                            aer_part.lat.values, met_part.lat.values
-                        ) or not np.array_equal(
-                            aer_part.lon.values, met_part.lon.values
-                        ):
-                            msg = "MERRA2 source latitude/longitude grids do not match"
-                            raise ValueError(msg)
-                        extinction = calculate_extinction(
-                            aer_part, efficiency_profiles, wavelengths_nm
-                        )
-                        model_pressure = met_part.PL.values.astype(float)
-                        temperature = met_part.T.values.astype(float)
-                        delp = aer_part.DELP.values.astype(float)
-                        latitude = aer_part.lat.values.astype(float)
-                        longitude = aer_part.lon.values.astype(float)
-                        geoid_offset = _interpolate_geoid_undulation(
-                            geoid_undulation, latitude, longitude
-                        )
-                        model_height = (
-                            _geopotential_to_geometric_height(
-                                met_part.H.values.astype(float),
-                                latitude[None, :, None],
-                            )
-                            + geoid_offset[None, :, :]
-                        )
-                        surface_altitude = (
-                            _geopotential_to_geometric_height(
-                                met_part.PHIS.values.astype(float) / _STANDARD_GRAVITY,
-                                latitude[:, None],
-                            )
-                            + geoid_offset
-                        )
-                        with np.errstate(divide="ignore", invalid="ignore"):
-                            layer_thickness = (
-                                _GAS_CONSTANT_DRY_AIR
-                                * temperature
-                                / _STANDARD_GRAVITY
-                                * delp
-                                / model_pressure
-                            )
-                        reservoirs[band].add(
-                            extinction,
-                            model_height,
-                            model_pressure,
-                            layer_thickness,
-                            tp_part.values.astype(float),
-                            surface_altitude,
-                            aer_part.lat.values.astype(float),
-                            aer_part.lon.values.astype(float),
-                            timestamp,
-                            time_index,
-                            latitude_indices,
-                        )
-            if checkpoint_path is not None:
-                _save_month_checkpoint(
-                    checkpoint_path,
-                    month,
-                    checkpoint_config,
-                    day,
-                    rng,
-                    reservoirs,
-                )
-            processed_days += 1
-            logging.info(
-                "MERRA2 month %02d progress: %d/%d days complete (last: %s)",
-                month,
-                processed_days,
-                total_days,
-                day.isoformat(),
-            )
+    day = first_day
+    while day <= final_day:
+        if last_completed_day is not None and day <= last_completed_day:
             day += timedelta(days=1)
+            continue
+        logging.info(
+            "Starting MERRA2 month %02d day %s (%d/%d)",
+            month,
+            day.isoformat(),
+            (day - first_day).days + 1,
+            total_days,
+        )
+        with _open_daily_granules(
+            day,
+            data_root,
+            stage_daily=stage_daily,
+            checkpointing=checkpointing,
+        ) as (
+            day_source_identities,
+            aerosol,
+            meteorology,
+            tropopause,
+        ):
+            _validate_inputs(aerosol, meteorology, tropopause)
+            latitudes = aerosol.lat.values
+            times = aerosol.time.values
+            logging.info(
+                "Opened MERRA2 inputs for %s (%d timestamps)",
+                day.isoformat(),
+                len(times),
+            )
+            for time_index, timestamp in enumerate(times):
+                logging.info(
+                    "Processing MERRA2 timestamp %d/%d for %s: %s",
+                    time_index + 1,
+                    len(times),
+                    day.isoformat(),
+                    timestamp,
+                )
+                tropopause_index = np.flatnonzero(tropopause.time.values == timestamp)
+                if tropopause_index.size != 1:
+                    msg = f"No exact M2I1NXASM TROPPB sample for {timestamp} in {day}"
+                    raise ValueError(msg)
+                for band, (south, north) in _BANDS.items():
+                    latitude_indices = np.flatnonzero(
+                        (latitudes >= south) & (latitudes <= north)
+                    )
+                    lat_slice = slice(
+                        int(latitude_indices[0]), int(latitude_indices[-1]) + 1
+                    )
+                    aer_part = (
+                        aerosol[_AEROSOL_VARIABLES]
+                        .isel(time=time_index, lat=lat_slice)
+                        .load()
+                    )
+                    met_part = (
+                        meteorology[_METEOROLOGY_VARIABLES]
+                        .isel(time=time_index, lat=lat_slice)
+                        .load()
+                    )
+                    tp_part = tropopause.TROPPB.isel(
+                        time=int(tropopause_index[0]), lat=lat_slice
+                    ).load()
+                    if not np.array_equal(
+                        aer_part.lat.values, met_part.lat.values
+                    ) or not np.array_equal(aer_part.lon.values, met_part.lon.values):
+                        msg = "MERRA2 source latitude/longitude grids do not match"
+                        raise ValueError(msg)
+                    extinction = calculate_extinction(
+                        aer_part, efficiency_profiles, wavelengths_nm
+                    )
+                    model_pressure = met_part.PL.values.astype(float)
+                    temperature = met_part.T.values.astype(float)
+                    delp = aer_part.DELP.values.astype(float)
+                    latitude = aer_part.lat.values.astype(float)
+                    longitude = aer_part.lon.values.astype(float)
+                    geoid_offset = _interpolate_geoid_undulation(
+                        geoid_undulation, latitude, longitude
+                    )
+                    model_height = (
+                        _geopotential_to_geometric_height(
+                            met_part.H.values.astype(float),
+                            latitude[None, :, None],
+                        )
+                        + geoid_offset[None, :, :]
+                    )
+                    surface_altitude = (
+                        _geopotential_to_geometric_height(
+                            met_part.PHIS.values.astype(float) / _STANDARD_GRAVITY,
+                            latitude[:, None],
+                        )
+                        + geoid_offset
+                    )
+                    with np.errstate(divide="ignore", invalid="ignore"):
+                        layer_thickness = (
+                            _GAS_CONSTANT_DRY_AIR
+                            * temperature
+                            / _STANDARD_GRAVITY
+                            * delp
+                            / model_pressure
+                        )
+                    reservoirs[band].add(
+                        extinction,
+                        model_height,
+                        model_pressure,
+                        layer_thickness,
+                        tp_part.values.astype(float),
+                        surface_altitude,
+                        aer_part.lat.values.astype(float),
+                        aer_part.lon.values.astype(float),
+                        timestamp,
+                        time_index,
+                        latitude_indices,
+                    )
+                logging.info(
+                    "Processed MERRA2 timestamp %d/%d for %s: %s",
+                    time_index + 1,
+                    len(times),
+                    day.isoformat(),
+                    timestamp,
+                )
+        if checkpointing:
+            if set(day_source_identities) != set(_PRODUCTS):
+                msg = f"Unable to identify all MERRA2 source granules for {day}"
+                raise ValueError(msg)
+            source_identities[day.isoformat()] = day_source_identities
+            _save_month_checkpoint(
+                checkpoint_path,
+                month,
+                checkpoint_config,
+                day,
+                rng,
+                reservoirs,
+                source_identities,
+            )
+        processed_days += 1
+        logging.info(
+            "MERRA2 month %02d progress: %d/%d days complete (last: %s)",
+            month,
+            processed_days,
+            total_days,
+            day.isoformat(),
+        )
+        day += timedelta(days=1)
 
     result = []
     for band in _BANDS:
@@ -1253,6 +1534,7 @@ def build_catalogue(
     reservoir_size: int = 50000,
     seed: int = 20261021,
     workers: int = 1,
+    stage_daily: bool = False,
 ) -> Path:
     if start_year < 1980 or end_year < start_year:
         msg = "MERRA2 years must satisfy 1980 <= start_year <= end_year"
@@ -1265,12 +1547,26 @@ def build_catalogue(
         msg = "workers must be at least 1"
         raise ValueError(msg)
     workers = int(workers)
+    logging.info(
+        "Preparing MERRA2 catalogue for %d-%d using %d worker(s)",
+        start_year,
+        end_year,
+        workers,
+    )
+    if stage_daily and data_root is not None:
+        logging.info("Daily staging is unnecessary for local MERRA2 inputs")
+    logging.info("Loading MERRA2 optical tables from %s", optics_root)
     efficiencies, wavelengths_nm = load_efficiency_profiles(optics_root)
+    logging.info("Loaded MERRA2 optical tables")
+    logging.info("Loading EGM2008 geoid grid")
     geoid_undulation = _load_geoid_undulation()
+    logging.info("Loaded EGM2008 geoid grid")
+    logging.info("Hashing optical tables and geoid grid for checkpoint validation")
     optical_digests = {
         filename: _sha256(optics_root / filename) for filename in _OPTICS_FILES
     }
     checkpoint_config = {
+        "algorithm_version": _CHECKPOINT_ALGORITHM_VERSION,
         "start_year": start_year,
         "end_year": end_year,
         "reservoir_size": reservoir_size,
@@ -1279,10 +1575,9 @@ def build_catalogue(
         "optical_tables_sha256": optical_digests,
         "geoid_sha256": _sha256(_geoid_cache_path()),
     }
-    checkpoint_id = hashlib.sha256(
-        json.dumps(checkpoint_config, sort_keys=True).encode("utf-8")
-    ).hexdigest()[:16]
+    checkpoint_id = _checkpoint_id(checkpoint_config)
     checkpoint_dir = output / ".checkpoints" / checkpoint_id
+    logging.info("Using checkpoint directory %s", checkpoint_dir)
     month_arguments = [
         (
             month,
@@ -1296,6 +1591,7 @@ def build_catalogue(
             seed,
             checkpoint_dir / f"month_{month:02d}.npz",
             checkpoint_config,
+            stage_daily,
         )
         for month in _MONTHS
     ]
@@ -1305,6 +1601,7 @@ def build_catalogue(
             logging.info("Processing MERRA2 month %02d", arguments[0])
             month_records.append(_process_month(*arguments))
     else:
+        logging.info("Starting %d concurrent MERRA2 month workers", workers)
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = [
                 executor.submit(_process_month, *arguments)
@@ -1502,6 +1799,11 @@ def main() -> None:
     parser.add_argument("--reservoir-size", type=int, default=50000)
     parser.add_argument("--seed", type=int, default=20261021)
     parser.add_argument(
+        "--stage-daily",
+        action="store_true",
+        help="Download each remote day's granules to temporary storage before processing",
+    )
+    parser.add_argument(
         "--workers",
         type=int,
         default=1,
@@ -1519,6 +1821,13 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(message)s",
     )
     data_root = None if args.data_root is None else args.data_root.expanduser()
+    logging.info(
+        "MERRA2 builder started (years %d-%d, workers %d, input %s)",
+        args.start_year,
+        args.end_year,
+        args.workers,
+        data_root if data_root is not None else "GES DISC",
+    )
     if args.smoke_date is not None:
         result = run_smoke_test(
             args.smoke_date,
@@ -1540,6 +1849,7 @@ def main() -> None:
         reservoir_size=args.reservoir_size,
         seed=args.seed,
         workers=args.workers,
+        stage_daily=args.stage_daily,
     )
 
 

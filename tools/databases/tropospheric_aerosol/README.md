@@ -74,14 +74,45 @@ directly. Transient HTTP failures (429 and common 5xx responses, connection
 errors, and timeouts) get up to five attempts with backoff. If a GES DISC
 range request returns 403, the builder resolves a fresh signed URL and retries
 the range request. Persistent failures stop the job with the original
-exception. After each fully processed day, the builder atomically saves the
-month workers' weighted-reservoir state under
+exception. The Slurm log includes timestamped startup and input-preparation
+milestones, month/checkpoint startup, each day started and completed, granule
+opens, checkpoint-validation progress, and timestamp processing progress. After
+each fully processed day, the builder atomically saves the month workers'
+weighted-reservoir state under
 `OUTPUT_DIR/.checkpoints/<build-id>/`. If the job fails, resubmit with the same
 `OUTPUT_DIR`, year range, seed, reservoir size, optical tables, and data
 source; the builder resumes each month after its last checkpointed day.
+The checkpoint identity includes the algorithm version. Before resuming, local
+granules are checked by SHA-256 and remote granules by their stable source URL,
+ETag, last-modified time, and size; a remote ETag is sufficient, otherwise
+both last-modified time and size are required. Temporary signed redirect URLs
+are not stored. A mismatch stops the resume rather than mixing source data.
+The checkpoint directory key includes the algorithm version, so incrementing
+`_CHECKPOINT_ALGORITHM_VERSION` in `build.py` automatically starts a separate
+checkpoint set whenever processing changes can alter reservoir sampling or
+selected profiles.
 Checkpoints are deleted after the catalogue and report are written
 successfully. They are stored in the output directory, so choose a persistent
 scratch location rather than `$SLURM_TMPDIR`.
+
+If remote range reads are slow, set `STAGE_DAILY=1` when submitting the build
+job. This downloads each day's three granules to a temporary directory on the
+compute node (under `$SLURM_TMPDIR` when available), processes them locally,
+and removes them before moving to the next day. Checkpoint source identities
+remain tied to the remote granules, so resume validation works after temporary
+files are deleted. Staging downloads each full granule and needs temporary
+space for the three files per active worker; with four workers, up to four days
+may be staged at once. Check available `$SLURM_TMPDIR` capacity before enabling
+it. For example:
+
+```bash
+STAGE_DAILY=1 bash tools/databases/tropospheric_aerosol/submit.sh \
+  --export=ALL,OPTICS_ROOT=/path/to/MERRA-2-Versions/v0.0.0,START_YEAR=2024,END_YEAR=2024
+```
+
+Use the same `OUTPUT_DIR` and build settings when resuming. `STAGE_DAILY` only
+changes how remote input files are read; it does not change the climatology or
+checkpoint identity.
 
 Set `START_YEAR` and
 `END_YEAR` to change the period, and set

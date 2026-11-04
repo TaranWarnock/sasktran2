@@ -18,10 +18,15 @@ OUTPUT_DIR="${OUTPUT_DIR:-${HOME}/scratch/output/sasktran/${START_YEAR}-${END_YE
 
 cd "$REPOSITORY"
 source tools/databases/tropospheric_aerosol/setup_job_env.sh
-"$PYTHON" tools/databases/tropospheric_aerosol/build.py \
-    --optics-root "$OPTICS_ROOT" \
-    --output "$OUTPUT_DIR" \
-    --start-year "$START_YEAR" \
-    --end-year "$END_YEAR" \
-    --workers "$WORKERS" \
+BUILD_ARGS=(
+    --optics-root "$OPTICS_ROOT"
+    --output "$OUTPUT_DIR"
+    --start-year "$START_YEAR"
+    --end-year "$END_YEAR"
+    --workers "$WORKERS"
     --verbose
+)
+if [[ "${STAGE_DAILY:-0}" == "1" ]]; then
+    BUILD_ARGS+=(--stage-daily)
+fi
+"$PYTHON" tools/databases/tropospheric_aerosol/build.py "${BUILD_ARGS[@]}"

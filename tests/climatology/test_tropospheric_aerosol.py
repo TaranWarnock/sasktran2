@@ -448,7 +448,13 @@ def test_remote_granule_retries_transient_failures_and_refreshes_expired_url(
         netcdf_path, engine="h5netcdf"
     )
     content = netcdf_path.read_bytes()
-    requests = {"head": 0, "get": 0, "signed_head": 0, "signed_get": 0}
+    requests = {
+        "head": 0,
+        "info_get": 0,
+        "range_get": 0,
+        "signed_head": 0,
+        "signed_get": 0,
+    }
 
     class Handler(BaseHTTPRequestHandler):
         def do_HEAD(self):
@@ -459,27 +465,28 @@ def test_remote_granule_retries_transient_failures_and_refreshes_expired_url(
                 if requests["head"] == 1:
                     self.send_error(503)
                     return
-                if requests["head"] == 3:
-                    self.send_response(302)
-                    self.send_header(
-                        "Location", f"http://127.0.0.1:{self.server.server_port}/signed"
-                    )
-                    self.end_headers()
-                    return
+                self.send_response(302)
+                self.send_header(
+                    "Location", f"http://127.0.0.1:{self.server.server_port}/signed"
+                )
+                self.end_headers()
+                return
             self.send_response(200)
             self.send_header("Content-Length", str(len(content)))
             self.send_header("Accept-Ranges", "bytes")
+            self.send_header("ETag", '"stable-test-etag"')
             self.end_headers()
 
         def do_GET(self):
             if self.path.startswith("/signed"):
                 requests["signed_get"] += 1
             else:
-                requests["get"] += 1
-                if requests["get"] == 1:
+                if "Range" not in self.headers:
+                    requests["info_get"] += 1
                     self.send_error(503)
                     return
-                if requests["get"] == 2:
+                requests["range_get"] += 1
+                if requests["range_get"] == 1:
                     self.send_error(403)
                     return
             start, end = map(
@@ -500,13 +507,123 @@ def test_remote_granule_retries_transient_failures_and_refreshes_expired_url(
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
+    source_url = f"http://127.0.0.1:{server.server_port}/remote.nc"
+    captured_identity = []
     try:
-        with build._open_granule(
-            f"http://127.0.0.1:{server.server_port}/remote.nc"
-        ) as dataset:
+        with build._open_granule(source_url, captured_identity.append) as dataset:
             result = dataset["sample"].load().values
         assert_allclose(result, np.arange(4, dtype=np.float32))
-        assert requests == {"head": 3, "get": 2, "signed_head": 1, "signed_get": 1}
+        assert captured_identity == [
+            {
+                "kind": "remote",
+                "url": source_url,
+                "etag": '"stable-test-etag"',
+                "last_modified": None,
+                "size": len(content),
+            }
+        ]
+        assert requests == {
+            "head": 3,
+            "info_get": 1,
+            "range_get": 1,
+            "signed_head": 2,
+            "signed_get": 1,
+        }
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def test_source_identities_use_stable_local_and_remote_metadata(tmp_path):
+    local_path = tmp_path / "granule.nc4"
+    local_path.write_bytes(b"first")
+    first_identity = build._local_source_identity(local_path)
+    local_path.write_bytes(b"other")
+    second_identity = build._local_source_identity(local_path)
+    assert first_identity["sha256"] != second_identity["sha256"]
+
+    source_url = "https://data.gesdisc.earthdata.nasa.gov/data/MERRA2/file.nc4"
+    remote_identity = build._remote_source_identity(
+        source_url,
+        {
+            "url": "https://temporary-cloudfront.example/file.nc4?signature=secret",
+            "ETag": '"stable-object-etag"',
+            "size": 1234,
+        },
+    )
+    assert remote_identity == {
+        "kind": "remote",
+        "url": source_url,
+        "etag": '"stable-object-etag"',
+        "last_modified": None,
+        "size": 1234,
+    }
+    last_modified_identity = build._remote_source_identity(
+        source_url,
+        {"Last-Modified": "Mon, 02 Nov 2026 10:00:00 GMT", "size": 1234},
+    )
+    assert last_modified_identity["last_modified"] == "Mon, 02 Nov 2026 10:00:00 GMT"
+    with pytest.raises(ValueError, match="Last-Modified header with known size"):
+        build._remote_source_identity(
+            source_url, {"Last-Modified": "Mon, 02 Nov 2026 10:00:00 GMT"}
+        )
+    with pytest.raises(ValueError, match="Last-Modified header with known size"):
+        build._remote_source_identity(source_url, {"size": 1234})
+
+
+def test_daily_staging_downloads_remote_granules_and_cleans_temporary_files(
+    tmp_path, monkeypatch
+):
+    netcdf_path = tmp_path / "source.nc4"
+    xr.Dataset({"sample": ("x", np.array([3.0], dtype=np.float32))}).to_netcdf(
+        netcdf_path, engine="h5netcdf"
+    )
+    content = netcdf_path.read_bytes()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(content)))
+            self.send_header("ETag", '"stable-test-etag"')
+            self.end_headers()
+            self.wfile.write(content)
+
+        def log_message(self, *_args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    root_url = f"http://127.0.0.1:{server.server_port}"
+    locations = {
+        product: f"{root_url}/{product}.nc4" for product in build._PRODUCTS
+    }
+    monkeypatch.setattr(build, "_source_locations", lambda *_args: locations)
+    monkeypatch.setattr(
+        build,
+        "_source_identity",
+        lambda location: build._remote_source_identity(
+            location, {"ETag": '"stable-test-etag"', "size": len(content)}
+        ),
+    )
+    monkeypatch.setenv("SLURM_TMPDIR", str(tmp_path))
+    try:
+        with build._open_daily_granules(
+            build.date(2024, 1, 1),
+            None,
+            stage_daily=True,
+            checkpointing=True,
+        ) as (identities, aerosol, meteorology, tropopause):
+            assert identities == {
+                product: build._source_identity(location)
+                for product, location in locations.items()
+            }
+            assert aerosol["sample"].load().item() == 3.0
+            assert meteorology["sample"].load().item() == 3.0
+            assert tropopause["sample"].load().item() == 3.0
+            assert len(list(tmp_path.glob("sasktran2-merra2-20240101-*"))) == 1
+        assert not list(tmp_path.glob("sasktran2-merra2-20240101-*"))
     finally:
         server.shutdown()
         server.server_close()
@@ -555,8 +672,42 @@ def test_month_checkpoint_restores_reservoir_and_skips_completed_days(
     tmp_path, monkeypatch
 ):
     month = 1
-    config = {"start_year": 2024, "end_year": 2024, "seed": 42}
+    config = {
+        "algorithm_version": build._CHECKPOINT_ALGORITHM_VERSION,
+        "start_year": 2024,
+        "end_year": 2024,
+        "seed": 42,
+    }
+    assert build._checkpoint_id(config) != build._checkpoint_id(
+        {**config, "algorithm_version": config["algorithm_version"] + 1}
+    )
     checkpoint_path = tmp_path / "checkpoints" / "month_01.npz"
+    source_identities = {
+        build.date(2024, 1, day).isoformat(): {
+            product: {
+                "kind": "remote",
+                "url": str(build._source_location(product, build.date(2024, 1, day), None)),
+                "etag": f'"etag-{product}-{day}"',
+                "size": 1000,
+            }
+            for product in build._PRODUCTS
+        }
+        for day in range(1, 32)
+    }
+    changed_source = False
+
+    def source_identity(location):
+        source = str(location)
+        if changed_source and source.endswith("20240102.nc4"):
+            return {"kind": "remote", "url": source, "etag": '"changed"', "size": 1000}
+        for daily_identities in source_identities.values():
+            for identity in daily_identities.values():
+                if identity["url"] == source:
+                    return identity
+        msg = f"Unexpected source location: {location}"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr(build, "_source_identity", source_identity)
     rng = np.random.default_rng(43)
     reservoirs = {
         band: build._WeightedReservoir(1000, rng) for band in build._BANDS
@@ -582,34 +733,52 @@ def test_month_checkpoint_restores_reservoir_and_skips_completed_days(
         build.date(2024, 1, 31),
         rng,
         reservoirs,
+        source_identities,
     )
     expected_random = rng.random(3)
 
-    with pytest.raises(ValueError, match="Checkpoint settings do not match"):
+    with pytest.raises(ValueError, match="algorithm version do not match"):
         build._load_month_checkpoint(
             checkpoint_path,
             month,
-            {**config, "seed": 43},
+            {**config, "algorithm_version": config["algorithm_version"] + 1},
             2024,
             2024,
+            None,
             np.random.default_rng(0),
             {},
         )
+
+    changed_source = True
+    with pytest.raises(ValueError, match="source identity changed"):
+        build._load_month_checkpoint(
+            checkpoint_path,
+            month,
+            config,
+            2024,
+            2024,
+            None,
+            np.random.default_rng(0),
+            {},
+        )
+    changed_source = False
 
     resumed_rng = np.random.default_rng(0)
     resumed_reservoirs = {
         band: build._WeightedReservoir(1000, resumed_rng) for band in build._BANDS
     }
-    last_completed_day = build._load_month_checkpoint(
+    last_completed_day, restored_source_identities = build._load_month_checkpoint(
         checkpoint_path,
         month,
         config,
         2024,
         2024,
+        None,
         resumed_rng,
         resumed_reservoirs,
     )
     assert last_completed_day == build.date(2024, 1, 31)
+    assert restored_source_identities == source_identities
     assert_allclose(resumed_rng.random(3), expected_random)
     for band in build._BANDS:
         assert_allclose(resumed_reservoirs[band].aod, reservoirs[band].aod)
@@ -646,13 +815,16 @@ def test_month_checkpoint_restores_reservoir_and_skips_completed_days(
     assert len(records) == len(build._BANDS) * len(build._TIERS)
 
 
-def test_builder_rejects_incomplete_local_source(tmp_path):
+def test_builder_rejects_incomplete_local_source(tmp_path, caplog):
     geoid_undulation = xr.DataArray(
         np.zeros((2, 2)),
         coords={"lat": [-90.0, 90.0], "lon": [0.0, 360.0]},
         dims=("lat", "lon"),
     )
-    with pytest.raises(FileNotFoundError, match="Local MERRA2 inputs are incomplete"):
+    with (
+        caplog.at_level("INFO"),
+        pytest.raises(FileNotFoundError, match="Local MERRA2 inputs are incomplete"),
+    ):
         build._process_month(
             1,
             2026,
@@ -664,6 +836,8 @@ def test_builder_rejects_incomplete_local_source(tmp_path):
             1000,
             42,
         )
+    assert "Starting MERRA2 month 01" in caplog.text
+    assert "Starting MERRA2 month 01 day 2026-01-01" in caplog.text
 
 
 def test_builder_requires_a_positive_worker_count(tmp_path):
