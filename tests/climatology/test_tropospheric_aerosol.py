@@ -11,6 +11,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import sasktran2 as sk
 import xarray as xr
 from numpy.testing import assert_allclose, assert_array_equal
 from sasktran2.climatology import tropospheric_aerosol as aerosol
@@ -68,12 +69,26 @@ def catalogue():
         axis=1,
     )
     shape = (12, 4)
+    species = list(build._COMPONENTS)
+    shares = np.arange(1, len(species) + 1, dtype=float)
+    shares /= shares.sum()
+    species_ext = shares[None, None, :, None] * ext[:, :, None, :, 1]
     return xr.Dataset(
         {
             "extinction_per_m": (
                 ("scenario", "month", "altitude_m", "wavelength_nm"),
                 ext,
                 {"units": "m-1"},
+            ),
+            "species_extinction_550nm_per_m": (
+                ("scenario", "month", "species", "altitude_m"),
+                species_ext,
+                {"units": "m-1"},
+            ),
+            "relative_humidity": (
+                ("scenario", "month", "altitude_m"),
+                np.full((12, 4, len(altitude)), 0.5),
+                {"units": "1"},
             ),
             "latitude_band": (("scenario", "month"), band),
             "loading": (("scenario", "month"), loading),
@@ -106,10 +121,11 @@ def catalogue():
         coords={
             "scenario": scenarios,
             "month": months,
+            "species": species,
             "altitude_m": ("altitude_m", altitude, {"units": "m"}),
             "wavelength_nm": ("wavelength_nm", wavelengths, {"units": "nm"}),
         },
-        attrs={"catalogue_version": "v1", "schema_version": 1},
+        attrs={"catalogue_version": "v1", "schema_version": 2},
     )
 
 
@@ -175,13 +191,23 @@ def test_invalid_profile_selection(
 
 
 @pytest.mark.parametrize(
-    ("change", "message"), [("schema", "schema/version"), ("unit", "units")]
+    ("change", "message"),
+    [
+        ("schema", "schema/version"),
+        ("unit", "units"),
+        ("species", "species_extinction_550nm_per_m"),
+        ("humidity", "relative_humidity"),
+    ],
 )
 def test_invalid_catalogue(catalogue, tmp_path, change, message):
     if change == "schema":
-        catalogue.attrs["schema_version"] = 2
-    else:
+        catalogue.attrs["schema_version"] = 1
+    elif change == "unit":
         catalogue.extinction_per_m.attrs["units"] = "km-1"
+    elif change == "species":
+        catalogue = catalogue.drop_vars("species_extinction_550nm_per_m")
+    else:
+        catalogue["relative_humidity"] = catalogue.relative_humidity + 1.0
     path = tmp_path / "invalid.nc"
     catalogue.to_netcdf(path)
     with pytest.raises(ValueError, match=message):
@@ -208,6 +234,175 @@ def test_constituent_uses_selected_reference_extinction(catalogue_path):
     assert_allclose(constituent.extinction_per_m, result.extinction_per_m)
 
 
+@pytest.fixture
+def wide_optics_root(tmp_path, monkeypatch):
+    # Cover the synthetic catalogue's 250-1000 nm, and keep generated optical
+    # databases out of the user's database root.
+    monkeypatch.setenv("SASKTRAN2_DATABASE_ROOT", str(tmp_path / "database"))
+    root = tmp_path / "optics"
+    root.mkdir()
+    return _write_optics_tables(
+        root,
+        dict.fromkeys(build._OPTICS_FILES, np.array([200e-9, 550e-9, 1100e-9])),
+    )
+
+
+def _expected_mixture(catalogue):
+    # Synthetic tables: every species has the same bext at a given RH, so the
+    # mass weights reduce to the stored species shares.
+    shares = catalogue.species_extinction_550nm_per_m.isel(
+        scenario=0, month=0, altitude_m=1
+    ).values
+    shares = shares / shares.sum()
+    tables = [build._COMPONENTS[name][0] for name in catalogue.species.values]
+    ssa = np.array([_TABLE_SSA_G[table][0] for table in tables])
+    g = np.array([_TABLE_SSA_G[table][1] for table in tables])
+    mixed_ssa = np.sum(shares * ssa)
+    mixed_a1 = np.array([1.0, np.sum(shares * ssa * 3 * g) / mixed_ssa, 0.2])
+    return mixed_ssa, mixed_a1
+
+
+def test_default_constituent_follows_catalogue_spectra_and_merra2_optics(
+    catalogue, catalogue_path, wide_optics_root
+):
+    scenario, month = "tropical_typical", 4
+    constituent = aerosol.constituent(
+        scenario, month=month, path=catalogue_path, optics_root=wide_optics_root
+    )
+    case = catalogue.sel(scenario=scenario, month=month)
+    reference = case.extinction_per_m.sel(wavelength_nm=550.0).values
+    valid = reference > 0
+    assert_allclose(constituent.extinction_per_m, reference)
+
+    database = constituent._optical_property._database
+    assert database.xs_total.dims == ("altitude_m", "wavelength_nm")
+    for wavelength in case.wavelength_nm.values:
+        assert_allclose(
+            database.xs_total.sel(wavelength_nm=wavelength).values[valid]
+            * reference[valid],
+            case.extinction_per_m.sel(wavelength_nm=wavelength).values[valid],
+            rtol=1e-12,
+        )
+    mixed_ssa, mixed_a1 = _expected_mixture(catalogue)
+    ssa = (database.xs_scattering / database.xs_total).values
+    assert (ssa <= 1).all()
+    assert_allclose(ssa, mixed_ssa, rtol=1e-12)
+    assert_allclose(
+        database.lm_a1.isel(altitude_m=1, wavelength_nm=0).values,
+        mixed_a1,
+        rtol=1e-12,
+    )
+    for name in ("lm_a2", "lm_a3", "lm_a4", "lm_b1", "lm_b2"):
+        assert not database[name].values.any()
+
+
+def _engine_inputs(nstokes, constituent):
+    altitudes_m = np.arange(0.0, 20001.0, 1000.0)
+    config = sk.Config()
+    config.num_stokes = nstokes
+    config.num_streams = 4
+    geometry = sk.Geometry1D(
+        0.6,
+        0.0,
+        6372000.0,
+        altitudes_m,
+        sk.InterpolationMethod.LinearInterpolation,
+        sk.GeometryType.PlaneParallel,
+    )
+    viewing_geo = sk.ViewingGeometry()
+    viewing_geo.add_ray(sk.GroundViewingSolar(0.6, 0.0, 0.8, 200000.0))
+    atmo = sk.Atmosphere(geometry, config, wavelengths_nm=np.array([400.0, 600.0]))
+    sk.climatology.us76.add_us76_standard_atmosphere(atmo)
+    atmo["rayleigh"] = sk.constituent.Rayleigh()
+    atmo["tropospheric_aerosol"] = constituent
+    return config, geometry, viewing_geo, atmo
+
+
+def test_default_constituent_runs_scalar_and_rejects_polarized(
+    catalogue_path, wide_optics_root
+):
+    constituent = aerosol.constituent(
+        "nh_midlat_extreme",
+        month=7,
+        path=catalogue_path,
+        optics_root=wide_optics_root,
+    )
+    config, geometry, viewing_geo, atmo = _engine_inputs(1, constituent)
+    radiance = sk.Engine(config, geometry, viewing_geo).calculate_radiance(atmo)
+    values = radiance["radiance"].to_numpy()
+    assert np.isfinite(values).all()
+    assert (values > 0).all()
+
+    config, geometry, viewing_geo, atmo = _engine_inputs(3, constituent)
+    with pytest.raises(ValueError, match="scalar"):
+        sk.Engine(config, geometry, viewing_geo).calculate_radiance(atmo)
+
+    # The synthetic catalogue covers 250-1000 nm.
+    config, geometry, viewing_geo, atmo = _engine_inputs(1, constituent)
+    atmo = sk.Atmosphere(geometry, config, wavelengths_nm=np.array([600.0, 1500.0]))
+    sk.climatology.us76.add_us76_standard_atmosphere(atmo)
+    atmo["tropospheric_aerosol"] = constituent
+    with pytest.raises(ValueError, match="optics cover"):
+        sk.Engine(config, geometry, viewing_geo).calculate_radiance(atmo)
+
+
+def test_mixed_optics_warn_when_the_engine_truncates_the_phase_function():
+    altitude = np.array([0.0, 20000.0])
+    wavelength = np.array([300.0, 900.0])
+    moments = np.zeros((2, 2, 32))
+    moments[..., 0] = 1.0
+    moments[..., 1] = 2.1
+    database = xr.Dataset(
+        {
+            "xs_total": (("altitude_m", "wavelength_nm"), np.ones((2, 2))),
+            "xs_scattering": (("altitude_m", "wavelength_nm"), np.full((2, 2), 0.9)),
+            **{
+                name: (("altitude_m", "wavelength_nm", "legendre"), values)
+                for name, values in [("lm_a1", moments)]
+                + [
+                    (name, np.zeros_like(moments))
+                    for name in ("lm_a2", "lm_a3", "lm_a4", "lm_b1", "lm_b2")
+                ]
+            },
+        },
+        coords={"altitude_m": altitude, "wavelength_nm": wavelength},
+    )
+    optics = aerosol._MERRA2MixedAerosol(db=database)
+    config = sk.Config()  # 16 single-scatter moments by default
+    geometry = sk.Geometry1D(
+        0.6,
+        0.0,
+        6372000.0,
+        np.arange(0.0, 20001.0, 1000.0),
+        sk.InterpolationMethod.LinearInterpolation,
+        sk.GeometryType.PlaneParallel,
+    )
+    atmo = sk.Atmosphere(geometry, config, wavelengths_nm=np.array([550.0]))
+    with pytest.warns(UserWarning, match="num_singlescatter_moments"):
+        optics.atmosphere_quantities(atmo, altitude_m=geometry.altitudes())
+
+
+def test_default_constituent_requires_optics_covering_the_catalogue(
+    catalogue_path, optics_root, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("SASKTRAN2_DATABASE_ROOT", str(tmp_path / "database"))
+    # The default synthetic tables cover only 500-600 nm.
+    with pytest.raises(ValueError, match="optics table"):
+        aerosol.constituent(
+            "tropical_low", month=1, path=catalogue_path, optics_root=optics_root
+        )
+
+
+# Per-table (single-scattering albedo, asymmetry parameter) of the synthetic tables
+_TABLE_SSA_G = {
+    "optics_BC.v1_3.nc": (0.3, 0.5),
+    "optics_DU.v14_2.nc": (0.9, 0.7),
+    "optics_OC.v1_3.nc": (0.95, 0.6),
+    "optics_SS.v3_3.nc": (1.0, 0.75),
+    "optics_SU.v1_3.nc": (1.0, 0.65),
+}
+
+
 def _write_optics_tables(root, wavelengths_by_file=None):
     radius_bins = {
         "optics_BC.v1_3.nc": 2,
@@ -224,13 +419,22 @@ def _write_optics_tables(root, wavelengths_by_file=None):
         values = np.empty((radius_count, len(humidity), len(wavelengths)))
         for ih, rh in enumerate(humidity):
             values[:, ih, :] = 1 + rh * 2
+        ssa, g = _TABLE_SSA_G[filename]
+        pmom = np.zeros((6, 3, *values.shape))
+        pmom[0] = np.array([1.0, 3.0 * g, 0.2])[:, None, None, None]
         xr.Dataset(
             {
                 "bext": (
                     ("radius", "rh", "lambda"),
                     values,
                     {"units": "m2 (kg dry mass)-1"},
-                )
+                ),
+                "bsca": (
+                    ("radius", "rh", "lambda"),
+                    ssa * values,
+                    {"units": "m2 (kg dry mass)-1"},
+                ),
+                "pmom": (("nPol", "nMom", "radius", "rh", "lambda"), pmom),
             },
             coords={
                 "radius": np.arange(radius_count),

@@ -76,18 +76,29 @@ The profile helper returns extinction on its packaged altitude grid or
 interpolates to a caller-provided grid. Profile altitudes are geometric heights
 above the WGS84 ellipsoid: MERRA2 geopotential heights are converted using
 latitude-dependent gravity and Earth radius, then offset by EGM2008 geoid
-undulation. The profile does not extend aerosol above the tropopause. To add it
-to an atmosphere, pass an optical property that supplies
-the wavelength-dependent scattering and phase information:
+undulation. The profile does not extend aerosol above the tropopause.
+
+To add a case to an atmosphere, use the constituent. Its extinction follows
+the catalogue spectra (250 nm to 40 um), and its single-scattering albedo and
+phase function come from the case's MERRA2 species mixture and relative
+humidity, using the MERRA2 aerosol optics tables. It supports scalar
+calculations only (`num_stokes = 1`). Dust and sea salt are strongly
+forward-scattering, so keep enough phase-function moments in the single
+scatter calculation:
 
 ```python
+config.num_singlescatter_moments = 128
 atmosphere["tropospheric_aerosol"] = aerosol.constituent(
     "tropical_typical",
     month=7,
-    optical_property=your_optical_property,
     altitudes_m=atmosphere.model_geometry.altitudes(),
 )
 ```
+
+Pass `optics_root` to use a local copy of the optics tables. Passing
+`optical_property` replaces the MERRA2 optics with your own, normalized to
+the catalogue extinction at `wavelength_nm`; its spectral shape may then
+disagree with the catalogue's.
 
 ## Rebuilding the catalogue
 
