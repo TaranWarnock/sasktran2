@@ -24,6 +24,7 @@ from datetime import date, datetime, timezone
 from functools import partial
 from pathlib import Path
 from types import MethodType
+from typing import NamedTuple
 from urllib.request import urlretrieve
 
 import numpy as np
@@ -59,6 +60,8 @@ _AEROSOL_VARIABLES = [
 ]
 _METEOROLOGY_VARIABLES = ["H", "PL", "T", "PHIS"]
 _TARGET_ALTITUDES_M = np.arange(0.0, 20001.0, 250.0)
+_WAVELENGTH_DECIMALS_NM = 2
+_REFERENCE_WAVELENGTH_NM = 550.0
 _GAS_CONSTANT_DRY_AIR = 287.05
 _STANDARD_GRAVITY = 9.80665
 _GES_DISC_ROOT = "https://data.gesdisc.earthdata.nasa.gov/data/MERRA2"
@@ -285,8 +288,13 @@ def load_efficiency_profiles(
                 )
             loaded[filename] = profiles
 
-    low = max(grid.min() for grid in wavelength_grids)
-    high = min(grid.max() for grid in wavelength_grids)
+    # The tables store wavelength as float32 metres, rounded differently per
+    # table; round before the union so one wavelength isn't kept several times.
+    rounded_grids = [
+        np.round(grid, _WAVELENGTH_DECIMALS_NM) for grid in wavelength_grids
+    ]
+    low = max(grid.min() for grid in rounded_grids)
+    high = min(grid.max() for grid in rounded_grids)
     if not low <= wavelength_nm <= high:
         msg = (
             f"{wavelength_nm:g} nm is outside the shared MERRA2 optical-table "
@@ -295,8 +303,8 @@ def load_efficiency_profiles(
         raise ValueError(msg)
     wavelengths = np.unique(
         np.concatenate(
-            [grid[(grid >= low) & (grid <= high)] for grid in wavelength_grids]
-            + [np.array([wavelength_nm])]
+            [grid[(grid >= low) & (grid <= high)] for grid in rounded_grids]
+            + [np.array([round(wavelength_nm, _WAVELENGTH_DECIMALS_NM)])]
         )
     )
     result = {}
@@ -370,17 +378,22 @@ def calculate_extinction(
     return result
 
 
-def calculate_spectral_extinction(
+def calculate_species_spectral_extinction(
     aerosol: xr.Dataset,
     efficiency_profiles: dict[str, tuple[np.ndarray, np.ndarray]],
     wavelengths_nm: np.ndarray,
 ) -> np.ndarray:
-    """Calculate one-column extinction for all wavelengths in m-1."""
+    """One-column extinction in m-1 per species: (levels, species, wavelengths).
+
+    Species follow the order of ``efficiency_profiles``.
+    """
     air_density = np.asarray(aerosol["AIRDENS"].values, dtype=float)
-    relative_humidity = np.asarray(aerosol["RH"].values, dtype=float)
-    result = np.zeros((air_density.size, len(wavelengths_nm)), dtype=np.float64)
-    humidity = np.clip(relative_humidity, 0.0, 0.99)
-    for species, (rh_grid, values) in efficiency_profiles.items():
+    humidity = np.clip(np.asarray(aerosol["RH"].values, dtype=float), 0.0, 0.99)
+    result = np.empty(
+        (air_density.size, len(efficiency_profiles), len(wavelengths_nm)),
+        dtype=np.float64,
+    )
+    for index, (species, (rh_grid, values)) in enumerate(efficiency_profiles.items()):
         ratio = np.asarray(aerosol[species].values, dtype=float)
         if ratio.shape != air_density.shape:
             msg = f"MERRA2 {species} dimensions do not match AIRDENS"
@@ -392,10 +405,21 @@ def calculate_spectral_extinction(
             ],
             axis=-1,
         )
-        result += (ratio * air_density).reshape(-1, 1) * efficiency.reshape(
+        result[:, index, :] = (ratio * air_density).reshape(-1, 1) * efficiency.reshape(
             -1, len(wavelengths_nm)
         )
     return result
+
+
+def calculate_spectral_extinction(
+    aerosol: xr.Dataset,
+    efficiency_profiles: dict[str, tuple[np.ndarray, np.ndarray]],
+    wavelengths_nm: np.ndarray,
+) -> np.ndarray:
+    """Calculate one-column extinction for all wavelengths in m-1."""
+    return calculate_species_spectral_extinction(
+        aerosol, efficiency_profiles, wavelengths_nm
+    ).sum(axis=1)
 
 
 def _collection_number(day: date) -> int:
@@ -879,7 +903,7 @@ def _conservative_grid_profile(
         np.column_stack([np.interp(bounds, edges, column) for column in cumulative.T]),
         axis=0,
     )
-    valid = (grid >= surface_altitude_m) & (grid <= tropopause_altitude_m)
+    valid = _valid_grid_points(surface_altitude_m, tropopause_altitude_m)
     if not valid.any():
         return np.full((len(grid), *extinction.shape[1:]), np.nan)
     first, last = np.flatnonzero(valid)[[0, -1]]
@@ -1108,6 +1132,47 @@ def _source_locations(day: date, data_root: Path | None) -> dict[str, Path | str
     }
 
 
+class _ColumnProfiles(NamedTuple):
+    """One selected column on _TARGET_ALTITUDES_M.
+
+    Shapes: extinction (altitude, wavelength); species extinction (altitude,
+    species in _COMPONENTS order); relative humidity (altitude,).
+    """
+
+    extinction_per_m: np.ndarray
+    species_extinction_550nm_per_m: np.ndarray
+    relative_humidity: np.ndarray
+
+
+def _valid_grid_points(
+    surface_altitude_m: float, tropopause_altitude_m: float
+) -> np.ndarray:
+    grid = _TARGET_ALTITUDES_M
+    return (grid >= surface_altitude_m) & (grid <= tropopause_altitude_m)
+
+
+def _grid_humidity(
+    relative_humidity: np.ndarray,
+    height_m: np.ndarray,
+    surface_altitude_m: float,
+    tropopause_altitude_m: float,
+) -> np.ndarray:
+    """RH (clipped 0-0.99) at grid points; outside the troposphere, nearest valid."""
+    order = np.argsort(height_m)
+    humidity = np.interp(
+        _TARGET_ALTITUDES_M,
+        height_m[order],
+        np.clip(relative_humidity, 0.0, 0.99)[order],
+    )
+    valid = np.flatnonzero(
+        _valid_grid_points(surface_altitude_m, tropopause_altitude_m)
+    )
+    if valid.size:
+        humidity[: valid[0]] = humidity[valid[0]]
+        humidity[valid[-1] + 1 :] = humidity[valid[-1]]
+    return humidity
+
+
 def _read_column_spectrum(
     day: date,
     time_index: int,
@@ -1117,7 +1182,7 @@ def _read_column_spectrum(
     geoid_undulation: xr.DataArray,
     efficiency_profiles: dict[str, tuple[np.ndarray, np.ndarray]],
     wavelengths_nm: np.ndarray,
-) -> np.ndarray:
+) -> _ColumnProfiles:
     locations = _source_locations(day, data_root)
     with (
         _open_granule(locations["aerosol"]) as aerosol,
@@ -1156,7 +1221,7 @@ def _read_column_spectrum(
             geoid_undulation, np.array([latitude]), np.array([longitude])
         )[0, 0]
     )
-    extinction = calculate_spectral_extinction(
+    species_extinction = calculate_species_spectral_extinction(
         aerosol_column, efficiency_profiles, wavelengths_nm
     )
     pressure = meteorology_column.PL.values.astype(float)
@@ -1177,14 +1242,39 @@ def _read_column_spectrum(
         * aerosol_column.DELP.values.astype(float)
         / pressure
     )
-    return _conservative_grid_profile(
-        extinction,
-        height,
-        layer_thickness,
-        pressure >= tropopause_pressure,
-        surface_height,
-        _height_at_pressure(pressure, height, tropopause_pressure),
+    tropospheric = pressure >= tropopause_pressure
+    tropopause_height = _height_at_pressure(pressure, height, tropopause_pressure)
+
+    def on_grid(values: np.ndarray) -> np.ndarray:
+        return _conservative_grid_profile(
+            values,
+            height,
+            layer_thickness,
+            tropospheric,
+            surface_height,
+            tropopause_height,
+        )
+
+    return _ColumnProfiles(
+        extinction_per_m=on_grid(species_extinction.sum(axis=1)),
+        species_extinction_550nm_per_m=on_grid(
+            species_extinction[:, :, _reference_wavelength_index(wavelengths_nm)]
+        ),
+        relative_humidity=_grid_humidity(
+            aerosol_column.RH.values.astype(float),
+            height,
+            surface_height,
+            tropopause_height,
+        ),
     )
+
+
+def _reference_wavelength_index(wavelengths_nm: np.ndarray) -> int:
+    matches = np.flatnonzero(wavelengths_nm == _REFERENCE_WAVELENGTH_NM)
+    if matches.size != 1:
+        msg = f"Wavelength grid must contain {_REFERENCE_WAVELENGTH_NM} nm exactly once"
+        raise ValueError(msg)
+    return int(matches[0])
 
 
 def _save_month_checkpoint(
@@ -1555,7 +1645,7 @@ def _process_month(
             )
             timestamp = np.datetime_as_string(reservoir.time[index], unit="s")
             selected_day = date.fromisoformat(timestamp[:10])
-            spectral_profile = _read_column_spectrum(
+            column = _read_column_spectrum(
                 selected_day,
                 int(reservoir.time_index[index]),
                 int(reservoir.latitude_index[index]),
@@ -1569,7 +1659,7 @@ def _process_month(
                 {
                     "scenario": f"{band}_{loading}",
                     "month": month,
-                    "extinction_per_m": spectral_profile,
+                    **column._asdict(),
                     "selection_aod_550nm": float(reservoir.aod[index]),
                     "selection_percentile": percentile,
                     "candidate_count": count,
@@ -1689,6 +1779,14 @@ def build_catalogue(
         (len(scenarios), len(months), altitude_size, len(wavelengths_nm)),
         dtype=np.float32,
     )
+    species_extinction = np.zeros(
+        (len(scenarios), len(months), len(_COMPONENTS), altitude_size),
+        dtype=np.float32,
+    )
+    relative_humidity = np.zeros(
+        (len(scenarios), len(months), altitude_size), dtype=np.float32
+    )
+    reference_index = _reference_wavelength_index(wavelengths_nm)
     metadata_names = [
         "selection_aod_550nm",
         "selection_percentile",
@@ -1710,7 +1808,21 @@ def build_catalogue(
     for record in records:
         scenario_index = scenarios.index(record["scenario"])
         month_index = months.index(record["month"])
+        species = np.asarray(record["species_extinction_550nm_per_m"])
+        if not np.allclose(
+            species.sum(axis=1),
+            record["extinction_per_m"][:, reference_index],
+            rtol=1e-6,
+            atol=0,
+        ):
+            msg = (
+                f"{record['scenario']} month {record['month']}: species extinction "
+                "does not sum to the total 550 nm extinction"
+            )
+            raise ValueError(msg)
         extinction[scenario_index, month_index] = record["extinction_per_m"]
+        species_extinction[scenario_index, month_index] = species.T
+        relative_humidity[scenario_index, month_index] = record["relative_humidity"]
         for name in metadata_names:
             metadata[name][scenario_index, month_index] = record[name]
     for name in metadata_names:
@@ -1744,6 +1856,29 @@ def build_catalogue(
                 extinction,
                 {"units": "m-1"},
             ),
+            "species_extinction_550nm_per_m": (
+                ("scenario", "month", "species", "altitude_m"),
+                species_extinction,
+                {
+                    "units": "m-1",
+                    "wavelength_nm": _REFERENCE_WAVELENGTH_NM,
+                    "description": (
+                        "550 nm extinction per MERRA2 aerosol species bin; sums to "
+                        "extinction_per_m at 550 nm"
+                    ),
+                },
+            ),
+            "relative_humidity": (
+                ("scenario", "month", "altitude_m"),
+                relative_humidity,
+                {
+                    "units": "1",
+                    "description": (
+                        "MERRA2 RH clipped to 0-0.99 at grid points; outside the "
+                        "troposphere, the nearest tropospheric value"
+                    ),
+                },
+            ),
             "latitude_band": (("scenario", "month"), latitude_bands),
             "loading": (("scenario", "month"), loading_levels),
             **{
@@ -1759,6 +1894,7 @@ def build_catalogue(
         coords={
             "scenario": scenarios,
             "month": months,
+            "species": list(_COMPONENTS),
             "altitude_m": (
                 "altitude_m",
                 _TARGET_ALTITUDES_M,
@@ -1772,7 +1908,7 @@ def build_catalogue(
         },
         attrs={
             "catalogue_version": "v1",
-            "schema_version": 1,
+            "schema_version": 2,
             "source_products": "M2I3NVAER, M2I3NVASM, M2I1NXASM",
             "source_data_version": "MERRA2 5.12.4",
             "source_years": f"{start_year}-{end_year}",
@@ -1802,7 +1938,14 @@ def build_catalogue(
     catalogue_path = output / "tropospheric_aerosol_v1.nc"
     dataset.to_netcdf(
         catalogue_path,
-        encoding={"extinction_per_m": {"zlib": True, "complevel": 4}},
+        encoding={
+            name: {"zlib": True, "complevel": 4}
+            for name in (
+                "extinction_per_m",
+                "species_extinction_550nm_per_m",
+                "relative_humidity",
+            )
+        },
     )
     report = {
         "catalogue_sha256": _sha256(catalogue_path),
@@ -1819,7 +1962,11 @@ def build_catalogue(
         "loading_windows": _TIERS,
         # Profiles live in the catalogue; the report keeps only scalar metadata.
         "scenarios": [
-            {key: value for key, value in record.items() if key != "extinction_per_m"}
+            {
+                key: value
+                for key, value in record.items()
+                if key not in _ColumnProfiles._fields
+            }
             for record in records
         ],
     }

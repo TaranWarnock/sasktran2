@@ -161,6 +161,15 @@ own grid therefore equals the native-layer tropospheric AOD. `candidate_count`
 is the estimated number of valid columns in the loading window, scaled from
 the sampled reservoir to all valid columns.
 
+Besides total spectral extinction, each case stores
+`species_extinction_550nm_per_m` (550 nm extinction per MERRA2 species bin,
+mapped with the same conservative scheme, so the species sum to the total) and
+`relative_humidity` on the grid, clipped to 0-0.99 as in the optical tables.
+Together with the MERRA2 optical tables these give each case's single
+scattering albedo and phase function. The catalogue schema is version 2. The
+wavelength grid is the union of the five tables' wavelengths within their
+shared range, rounded to 0.01 nm so float32 copies of one wavelength merge.
+
 MERRA2 `H` and `PHIS` are geopotential quantities. The builder converts their
 heights to geometric height using latitude-dependent Earth radius and gravity,
 then adds EGM2008 geoid undulation to express them above the WGS84 ellipsoid.

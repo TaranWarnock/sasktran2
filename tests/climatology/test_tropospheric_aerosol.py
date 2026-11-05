@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import json
 import sys
 import threading
 from contextlib import contextmanager
@@ -207,8 +208,7 @@ def test_constituent_uses_selected_reference_extinction(catalogue_path):
     assert_allclose(constituent.extinction_per_m, result.extinction_per_m)
 
 
-@pytest.fixture
-def optics_root(tmp_path):
+def _write_optics_tables(root, wavelengths_by_file=None):
     radius_bins = {
         "optics_BC.v1_3.nc": 2,
         "optics_DU.v14_2.nc": 5,
@@ -216,9 +216,11 @@ def optics_root(tmp_path):
         "optics_SS.v3_3.nc": 5,
         "optics_SU.v1_3.nc": 2,
     }
-    wavelengths = np.array([500e-9, 600e-9])
     humidity = np.array([0.0, 0.5, 0.99])
     for filename, radius_count in radius_bins.items():
+        wavelengths = (wavelengths_by_file or {}).get(
+            filename, np.array([500e-9, 600e-9])
+        )
         values = np.empty((radius_count, len(humidity), len(wavelengths)))
         for ih, rh in enumerate(humidity):
             values[:, ih, :] = 1 + rh * 2
@@ -235,8 +237,31 @@ def optics_root(tmp_path):
                 "rh": humidity,
                 "lambda": ("lambda", wavelengths, {"units": "m"}),
             },
-        ).to_netcdf(tmp_path / filename, engine="scipy")
-    return tmp_path
+        ).to_netcdf(root / filename, engine="scipy")
+    return root
+
+
+@pytest.fixture
+def optics_root(tmp_path):
+    return _write_optics_tables(tmp_path)
+
+
+def test_wavelength_grid_merges_float32_copies_of_the_same_wavelength(tmp_path):
+    # The real tables store wavelength as float32 metres, so the same wavelength
+    # differs slightly between tables (e.g. 550.0000119 vs 550.0 nm).
+    wavelengths = np.array([400e-9, 550e-9, 700e-9])
+    _write_optics_tables(
+        tmp_path,
+        {
+            **dict.fromkeys(build._OPTICS_FILES, wavelengths),
+            "optics_SU.v1_3.nc": wavelengths.astype(np.float32).astype(float),
+        },
+    )
+
+    _, grid = build.load_efficiency_profiles(tmp_path)
+
+    assert_array_equal(grid, [400.0, 550.0, 700.0])
+    assert np.diff(grid).min() > 0.01
 
 
 def test_merra_extinction_uses_mass_density_humidity_and_wavelength(
@@ -533,7 +558,7 @@ def test_smoke_test_reads_and_processes_one_column(optics_root, monkeypatch):
     assert result["tropospheric_aod_550nm_min"] > 0
 
     efficiencies, wavelengths_nm = build.load_efficiency_profiles(optics_root)
-    spectrum = build._read_column_spectrum(
+    column = build._read_column_spectrum(
         build.date(2024, 1, 1),
         0,
         0,
@@ -548,11 +573,20 @@ def test_smoke_test_reads_and_processes_one_column(optics_root, monkeypatch):
         wavelengths_nm,
     )
     iw550 = int(np.argmin(np.abs(wavelengths_nm - 550.0)))
+    grid = build._TARGET_ALTITUDES_M
     assert_allclose(
-        np.trapezoid(spectrum[:, iw550], build._TARGET_ALTITUDES_M),
+        np.trapezoid(column.extinction_per_m[:, iw550], grid),
         result["tropospheric_aod_550nm_per_timestamp"][0],
         rtol=1e-6,
     )
+    species = column.species_extinction_550nm_per_m
+    assert species.shape == (len(grid), len(build._COMPONENTS))
+    assert (species >= 0).all()
+    assert_allclose(
+        species.sum(axis=1), column.extinction_per_m[:, iw550], rtol=1e-12, atol=0
+    )
+    # The fake granules hold RH = 0.5 everywhere.
+    assert_allclose(column.relative_humidity, 0.5)
 
 
 def test_input_access_description_matches_how_inputs_were_read(tmp_path):
@@ -947,9 +981,7 @@ def test_month_checkpoint_restores_reservoir_and_skips_completed_days(
     monkeypatch.setattr(
         build,
         "_read_column_spectrum",
-        lambda *_args, **_kwargs: np.ones(
-            (len(build._TARGET_ALTITUDES_M), 1)
-        ),
+        lambda *_args, **_kwargs: _fake_column(np.array([550.0])),
     )
     records = build._process_month(
         month,
@@ -1067,3 +1099,121 @@ def test_builder_rejects_incomplete_local_source(tmp_path, caplog):
 def test_builder_requires_a_positive_worker_count(tmp_path):
     with pytest.raises(ValueError, match="workers must be at least 1"):
         build.build_catalogue(tmp_path, tmp_path / "output", workers=0)
+
+
+def _fake_column(wavelengths_nm, species_scale=1.0):
+    grid = build._TARGET_ALTITUDES_M
+    extinction_550 = np.where(grid <= 10000.0, 1e-5, 0.0)
+    shares = np.arange(1, len(build._COMPONENTS) + 1, dtype=float)
+    shares /= shares.sum()
+    return build._ColumnProfiles(
+        extinction_per_m=np.repeat(
+            extinction_550[:, None], len(wavelengths_nm), axis=1
+        ),
+        species_extinction_550nm_per_m=species_scale
+        * extinction_550[:, None]
+        * shares[None, :],
+        relative_humidity=np.full(len(grid), 0.4),
+    )
+
+
+def _fake_records(month, wavelengths_nm, species_scale=1.0):
+    return [
+        {
+            "scenario": f"{band}_{tier}",
+            "month": month,
+            **_fake_column(wavelengths_nm, species_scale)._asdict(),
+            "selection_aod_550nm": 0.1,
+            "selection_percentile": 50.0,
+            "candidate_count": 10,
+            "candidate_window_aod_min": 0.09,
+            "candidate_window_aod_max": 0.11,
+            "selected_latitude_degrees": 0.0,
+            "selected_longitude_degrees": 0.0,
+            "selected_time": f"2024-{month:02d}-01T00:00:00",
+            "tropopause_altitude_m": 10000.0,
+            "surface_altitude_m": 0.0,
+            "sampled_candidate_count": 1000,
+            "valid_candidate_count": 10000,
+        }
+        for band in build._BANDS
+        for tier in build._TIERS
+    ]
+
+
+def _patch_catalogue_inputs(monkeypatch, tmp_path, records_for_month):
+    geoid_path = tmp_path / "geoid.nc"
+    geoid_path.write_bytes(b"geoid")
+    monkeypatch.setattr(build, "_geoid_cache_path", lambda: geoid_path)
+    monkeypatch.setattr(
+        build,
+        "_load_geoid_undulation",
+        lambda: xr.DataArray(
+            np.zeros((2, 2)),
+            coords={"lat": [-90.0, 90.0], "lon": [0.0, 360.0]},
+            dims=("lat", "lon"),
+        ),
+    )
+    monkeypatch.setattr(
+        build, "_process_month", lambda month, *_args: records_for_month(month)
+    )
+
+
+def test_build_catalogue_writes_species_extinction_and_humidity(
+    optics_root, tmp_path, monkeypatch
+):
+    _, wavelengths = build.load_efficiency_profiles(optics_root)
+    _patch_catalogue_inputs(
+        monkeypatch, tmp_path, lambda month: _fake_records(month, wavelengths)
+    )
+
+    path = build.build_catalogue(
+        optics_root,
+        tmp_path / "output",
+        data_root=tmp_path,
+        start_year=2024,
+        end_year=2024,
+    )
+
+    with xr.open_dataset(path) as catalogue:
+        assert catalogue.attrs["schema_version"] == 2
+        assert catalogue.species.values.tolist() == list(build._COMPONENTS)
+        species = catalogue.species_extinction_550nm_per_m
+        assert species.dims == ("scenario", "month", "species", "altitude_m")
+        assert species.attrs["units"] == "m-1"
+        assert_allclose(
+            species.sum("species"),
+            catalogue.extinction_per_m.sel(wavelength_nm=550.0),
+            rtol=1e-6,
+        )
+        humidity = catalogue.relative_humidity
+        assert humidity.dims == ("scenario", "month", "altitude_m")
+        assert_allclose(humidity, 0.4, rtol=1e-6)
+    report = json.loads((tmp_path / "output" / "build_report_v1.json").read_text())
+    for scenario in report["scenarios"]:
+        assert not {
+            "extinction_per_m",
+            "species_extinction_550nm_per_m",
+            "relative_humidity",
+        } & set(scenario)
+
+
+def test_build_catalogue_rejects_species_that_do_not_sum_to_total(
+    optics_root, tmp_path, monkeypatch
+):
+    _, wavelengths = build.load_efficiency_profiles(optics_root)
+    _patch_catalogue_inputs(
+        monkeypatch,
+        tmp_path,
+        lambda month: _fake_records(month, wavelengths, species_scale=1.01),
+    )
+
+    with pytest.raises(ValueError, match="species extinction"):
+        build.build_catalogue(
+            optics_root,
+            tmp_path / "output",
+            data_root=tmp_path,
+            start_year=2024,
+            end_year=2024,
+        )
+    assert not (tmp_path / "output" / "tropospheric_aerosol_v1.nc").exists()
