@@ -67,7 +67,7 @@ _EGM2008_DATABASE_URL = (
     "https://arg.usask.ca/sasktranfiles/sasktran2_db/v_latest/"
     f"{_EGM2008_DATABASE_KEY}"
 )
-_CHECKPOINT_ALGORITHM_VERSION = 1
+_CHECKPOINT_ALGORITHM_VERSION = 2
 # GES DISC reprocessed these periods and publishes them only as stream 401.
 _STREAM_401_PERIODS = (
     (date(2020, 9, 1), date(2020, 9, 30)),
@@ -830,6 +830,67 @@ def _height_at_pressure(
     return float(np.interp(tropopause_pressure_pa, pressure, height))
 
 
+def _input_access_description(data_root: Path | None, stage_daily: bool) -> str:
+    if data_root is not None:
+        return "local MERRA2 granules"
+    if stage_daily:
+        return (
+            "GES DISC authenticated HTTP; full daily granules staged to local "
+            "temporary storage and deleted after processing"
+        )
+    return "GES DISC authenticated HTTP range streaming; no full granule downloads"
+
+
+def _conservative_grid_profile(
+    extinction: np.ndarray,
+    height_m: np.ndarray,
+    layer_thickness_m: np.ndarray,
+    tropospheric: np.ndarray,
+    surface_altitude_m: float,
+    tropopause_altitude_m: float,
+) -> np.ndarray:
+    """Map layer extinction (levels, ...) to _TARGET_ALTITUDES_M conserving AOD.
+
+    Each tropospheric layer's AOD (extinction * hydrostatic thickness) is spread
+    uniformly between the midpoints of its neighbours' heights, starting at the
+    surface. The cumulative AOD is binned into cells around each grid point;
+    cells below the surface or above the tropopause fold into the nearest valid
+    point (the runtime zeroes those points). Dividing by the trapezoid weights
+    makes the trapezoid integral on the grid equal the native tropospheric AOD.
+    """
+    order = np.argsort(height_m)
+    height = height_m[order]
+    columns = extinction.reshape(len(height_m), -1)[order]
+    layer_aod = np.where(
+        tropospheric[order, None], columns * layer_thickness_m[order, None], 0.0
+    )
+    edges = np.concatenate(
+        (
+            [min(surface_altitude_m, height[0])],
+            0.5 * (height[1:] + height[:-1]),
+            [height[-1] + 0.5 * (height[-1] - height[-2])],
+        )
+    )
+    cumulative = np.vstack((np.zeros(layer_aod.shape[1]), np.cumsum(layer_aod, axis=0)))
+    grid = _TARGET_ALTITUDES_M
+    spacing = grid[1] - grid[0]
+    bounds = np.concatenate(([-np.inf], grid[:-1] + 0.5 * spacing, [np.inf]))
+    cell_aod = np.diff(
+        np.column_stack([np.interp(bounds, edges, column) for column in cumulative.T]),
+        axis=0,
+    )
+    valid = (grid >= surface_altitude_m) & (grid <= tropopause_altitude_m)
+    if not valid.any():
+        return np.full((len(grid), *extinction.shape[1:]), np.nan)
+    first, last = np.flatnonzero(valid)[[0, -1]]
+    cell_aod[first] += cell_aod[:first].sum(axis=0)
+    cell_aod[last] += cell_aod[last + 1 :].sum(axis=0)
+    cell_aod[~valid] = 0.0
+    weights = np.full(len(grid), spacing)
+    weights[[0, -1]] = 0.5 * spacing
+    return (cell_aod / weights[:, None]).reshape(len(grid), *extinction.shape[1:])
+
+
 class _WeightedReservoir:
     def __init__(self, capacity: int, rng: np.random.Generator):
         if capacity < 1000:
@@ -919,7 +980,6 @@ class _WeightedReservoir:
             tropospheric = column_pressure >= tropopause_pressure_pa[ilat, ilon]
             order = np.argsort(column_height)
             sorted_height = column_height[order]
-            sorted_extinction = np.where(tropospheric, column_extinction, 0.0)[order]
             if not np.isfinite(sorted_height).all() or np.any(
                 np.diff(sorted_height) <= 0
             ):
@@ -931,19 +991,14 @@ class _WeightedReservoir:
                 column_height,
                 tropopause_pressure_pa[ilat, ilon],
             )
-            new_profiles[index] = np.interp(
-                _TARGET_ALTITUDES_M,
-                sorted_height,
-                sorted_extinction,
-                left=sorted_extinction[0],
-                right=0.0,
+            new_profiles[index] = _conservative_grid_profile(
+                column_extinction,
+                column_height,
+                layer_thickness_m[:, ilat, ilon],
+                tropospheric,
+                surface_altitude_m[ilat, ilon],
+                new_tropopause_altitude[index],
             )
-            new_profiles[
-                index, surface_altitude_m[ilat, ilon] > _TARGET_ALTITUDES_M
-            ] = 0
-            new_profiles[
-                index, new_tropopause_altitude[index] < _TARGET_ALTITUDES_M
-            ] = 0
 
         accepted_flat = flat[accepted]
         accepted_lat_index, accepted_lon_index = np.divmod(accepted_flat, nlon)
@@ -1115,22 +1170,21 @@ def _read_column_spectrum(
         float(_geopotential_to_geometric_height(surface_geopotential_height, latitude))
         + geoid_offset
     )
-    above = pressure < tropopause_pressure
-    extinction[above, :] = 0
-    order = np.argsort(height)
-    target = np.empty((len(_TARGET_ALTITUDES_M), len(wavelengths_nm)))
-    for index in range(len(wavelengths_nm)):
-        target[:, index] = np.interp(
-            _TARGET_ALTITUDES_M,
-            height[order],
-            extinction[order, index],
-            left=extinction[order, index][0],
-            right=0.0,
-        )
-    tropopause_height = _height_at_pressure(pressure, height, tropopause_pressure)
-    target[surface_height > _TARGET_ALTITUDES_M] = 0
-    target[tropopause_height < _TARGET_ALTITUDES_M] = 0
-    return target
+    layer_thickness = (
+        _GAS_CONSTANT_DRY_AIR
+        * meteorology_column.T.values.astype(float)
+        / _STANDARD_GRAVITY
+        * aerosol_column.DELP.values.astype(float)
+        / pressure
+    )
+    return _conservative_grid_profile(
+        extinction,
+        height,
+        layer_thickness,
+        pressure >= tropopause_pressure,
+        surface_height,
+        _height_at_pressure(pressure, height, tropopause_pressure),
+    )
 
 
 def _save_month_checkpoint(
@@ -1735,9 +1789,13 @@ def build_catalogue(
             "profile_selection": "Actual candidate nearest group median log1p(extinction / median_positive_extinction)",
             "candidate_sampling_seed": seed,
             "candidate_reservoir_size": reservoir_size,
-            "profile_altitude_grid": "0-20 km every 250 m; zero below ground and above TROPPB",
+            "profile_altitude_grid": (
+                "0-20 km every 250 m; zero below ground and above TROPPB; "
+                "values chosen so the trapezoid integral on this grid equals "
+                "the native-layer tropospheric AOD"
+            ),
             "optical_table_files": json.dumps(_OPTICS_FILES),
-            "remote_access": "GES DISC authenticated HTTP range streaming; no full granule downloads",
+            "remote_access": _input_access_description(data_root, stage_daily),
         },
     )
     output.mkdir(parents=True, exist_ok=True)
@@ -1759,7 +1817,11 @@ def build_catalogue(
         "months": _MONTHS,
         "latitude_bands": _BANDS,
         "loading_windows": _TIERS,
-        "scenarios": records,
+        # Profiles live in the catalogue; the report keeps only scalar metadata.
+        "scenarios": [
+            {key: value for key, value in record.items() if key != "extinction_per_m"}
+            for record in records
+        ],
     }
     (output / "build_report_v1.json").write_text(
         json.dumps(report, indent=2, default=str) + "\n", encoding="utf-8"

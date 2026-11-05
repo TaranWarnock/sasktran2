@@ -153,6 +153,14 @@ reservoir bounds memory while estimating monthly percentile windows; the seed,
 reservoir size, candidate counts, and selected source columns are recorded in
 the build report.
 
+Profiles are mapped to the 0-20 km, 250 m catalogue grid conservatively: each
+layer's AOD is spread over its height range, binned into cells around the grid
+points, and AOD below the surface or above the tropopause is folded into the
+nearest valid point. The trapezoid integral of each catalogue profile on its
+own grid therefore equals the native-layer tropospheric AOD. `candidate_count`
+is the estimated number of valid columns in the loading window, scaled from
+the sampled reservoir to all valid columns.
+
 MERRA2 `H` and `PHIS` are geopotential quantities. The builder converts their
 heights to geometric height using latitude-dependent Earth radius and gravity,
 then adds EGM2008 geoid undulation to express them above the WGS84 ellipsoid.

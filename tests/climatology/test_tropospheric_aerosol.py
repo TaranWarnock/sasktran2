@@ -532,6 +532,62 @@ def test_smoke_test_reads_and_processes_one_column(optics_root, monkeypatch):
     assert len(result["tropospheric_aod_550nm_per_timestamp"]) == 2
     assert result["tropospheric_aod_550nm_min"] > 0
 
+    efficiencies, wavelengths_nm = build.load_efficiency_profiles(optics_root)
+    spectrum = build._read_column_spectrum(
+        build.date(2024, 1, 1),
+        0,
+        0,
+        0,
+        Path("unused"),
+        xr.DataArray(
+            np.zeros((2, 2)),
+            coords={"lat": [-90.0, 90.0], "lon": [0.0, 360.0]},
+            dims=("lat", "lon"),
+        ),
+        efficiencies,
+        wavelengths_nm,
+    )
+    iw550 = int(np.argmin(np.abs(wavelengths_nm - 550.0)))
+    assert_allclose(
+        np.trapezoid(spectrum[:, iw550], build._TARGET_ALTITUDES_M),
+        result["tropospheric_aod_550nm_per_timestamp"][0],
+        rtol=1e-6,
+    )
+
+
+def test_input_access_description_matches_how_inputs_were_read(tmp_path):
+    assert "range streaming" in build._input_access_description(None, False)
+    assert "full daily granules" in build._input_access_description(None, True)
+    assert "local" in build._input_access_description(tmp_path, False)
+    assert "local" in build._input_access_description(tmp_path, True)
+
+
+@pytest.mark.parametrize("surface", [10.0, 545.0, -10.0])
+def test_conservative_grid_profile_preserves_tropospheric_aod(surface):
+    # MERRA2 levels run top-down; the helper must not depend on that order.
+    offsets = np.array([60.0, 250.0, 700.0, 1500.0, 3000.0, 6000.0, 9500.0, 11500.0])
+    heights = (surface + np.append(offsets, 14000.0))[::-1]
+    thickness = np.array(
+        [120.0, 260.0, 640.0, 960.0, 2040.0, 3960.0, 3040.0, 960.0, 4000.0]
+    )[::-1]
+    tropospheric = heights < surface + 11800.0
+    tropopause_altitude = surface + 11800.0
+    rng = np.random.default_rng(3)
+    extinction = rng.uniform(1e-6, 1e-4, size=(len(heights), 2))
+
+    profile = build._conservative_grid_profile(
+        extinction, heights, thickness, tropospheric, surface, tropopause_altitude
+    )
+
+    grid = build._TARGET_ALTITUDES_M
+    assert profile.shape == (len(grid), 2)
+    assert (profile >= 0).all()
+    assert not profile[(grid < surface) | (grid > tropopause_altitude)].any()
+    expected = np.sum(
+        np.where(tropospheric[:, None], extinction * thickness[:, None], 0.0), axis=0
+    )
+    assert_allclose(np.trapezoid(profile, grid, axis=0), expected, rtol=1e-12)
+
 
 def test_remote_granule_retries_transient_failures_and_refreshes_expired_url(
     tmp_path,
@@ -757,6 +813,11 @@ def test_area_weighted_reservoir_keeps_representative_profiles():
     )
     assert reservoir.aod.size == 1000
     assert reservoir.valid_candidates == 1000
+    assert_allclose(
+        np.trapezoid(reservoir.profiles, build._TARGET_ALTITUDES_M, axis=1),
+        reservoir.aod,
+        rtol=1e-12,
+    )
     index, percentile, count, lower, upper = reservoir.select_tier(0.5, 0.03)
     assert 47 <= percentile <= 53
     assert count > 0
