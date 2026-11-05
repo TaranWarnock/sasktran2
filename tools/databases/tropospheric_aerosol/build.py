@@ -68,6 +68,11 @@ _EGM2008_DATABASE_URL = (
     f"{_EGM2008_DATABASE_KEY}"
 )
 _CHECKPOINT_ALGORITHM_VERSION = 1
+# GES DISC reprocessed these periods and publishes them only as stream 401.
+_STREAM_401_PERIODS = (
+    (date(2020, 9, 1), date(2020, 9, 30)),
+    (date(2021, 6, 1), date(2021, 9, 30)),
+)
 _PRODUCTS = {
     "aerosol": ("M2I3NVAER", "inst3_3d_aer_Nv"),
     "meteorology": ("M2I3NVASM", "inst3_3d_asm_Nv"),
@@ -394,10 +399,7 @@ def calculate_spectral_extinction(
 
 
 def _collection_number(day: date) -> int:
-    # GES DISC reprocessed these periods and publishes them only as stream 401.
-    if date(2020, 9, 1) <= day <= date(2020, 9, 30) or (
-        date(2021, 6, 1) <= day <= date(2021, 9, 30)
-    ):
+    if any(start <= day <= end for start, end in _STREAM_401_PERIODS):
         return 401
     if day.year <= 1991:
         return 100
@@ -1227,11 +1229,9 @@ def _load_month_checkpoint(
                 if day <= last_completed_day
             ]
             if set(source_identities) != {day.isoformat() for day in completed_days}:
-                # Checkpoints from the old multi-year loop sampled every
-                # calendar day, not just this month's days.
                 msg = (
-                    f"Checkpoint covers days outside the requested month; "
-                    f"remove the stale checkpoint: {path}"
+                    f"Checkpoint source days do not match the requested "
+                    f"month's days; remove the stale checkpoint: {path}"
                 )
                 raise ValueError(msg)
             identity_days = len(completed_days)
@@ -1241,13 +1241,7 @@ def _load_month_checkpoint(
                 identity_days,
             )
             for validated_days, day in enumerate(completed_days, start=1):
-                expected_identities = source_identities.get(day.isoformat())
-                if expected_identities is None:
-                    msg = (
-                        f"Checkpoint is missing source identities for {day}; "
-                        f"remove the stale checkpoint: {path}"
-                    )
-                    raise ValueError(msg)
+                expected_identities = source_identities[day.isoformat()]
                 actual_identities = {
                     product: _source_identity(location)
                     for product, location in _source_locations(day, data_root).items()
@@ -1316,18 +1310,15 @@ def _process_month(
     rng = np.random.default_rng(seed + month)
     reservoirs = {band: _WeightedReservoir(reservoir_size, rng) for band in _BANDS}
     days = _month_days(month, start_year, end_year)
-    first_day = days[0]
-    final_day = days[-1]
     total_days = len(days)
     processed_days = 0
-    last_completed_day = None
     source_identities = {}
     checkpointing = checkpoint_path is not None
     logging.info(
         "Starting MERRA2 month %02d: %s through %s (%d days)",
         month,
-        first_day.isoformat(),
-        final_day.isoformat(),
+        days[0].isoformat(),
+        days[-1].isoformat(),
         total_days,
     )
     if checkpointing:
@@ -1355,9 +1346,7 @@ def _process_month(
                 processed_days,
                 total_days,
             )
-    for day_number, day in enumerate(days, start=1):
-        if last_completed_day is not None and day <= last_completed_day:
-            continue
+    for day_number, day in enumerate(days[processed_days:], start=processed_days + 1):
         logging.info(
             "Starting MERRA2 month %02d day %s (%d/%d)",
             month,
@@ -1488,11 +1477,10 @@ def _process_month(
                 reservoirs,
                 source_identities,
             )
-        processed_days += 1
         logging.info(
             "MERRA2 month %02d progress: %d/%d days complete (last: %s)",
             month,
-            processed_days,
+            day_number,
             total_days,
             day.isoformat(),
         )

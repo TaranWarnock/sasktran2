@@ -943,54 +943,39 @@ def test_multi_year_checkpoint_validates_only_days_in_the_month(tmp_path, monkey
         "_source_identity",
         lambda location: source_identities[location[0].isoformat()][location[1]],
     )
-    rng = np.random.default_rng(1)
-    build._save_month_checkpoint(
-        tmp_path / "month_01.npz",
-        month,
-        config,
-        completed_days[-1],
-        rng,
-        {},
-        source_identities,
-    )
-    last_completed_day, _ = build._load_month_checkpoint(
-        tmp_path / "month_01.npz",
-        month,
-        config,
-        2023,
-        2024,
-        None,
-        np.random.default_rng(0),
-        {},
-    )
+    path = tmp_path / "month_01.npz"
+
+    def save(identities):
+        build._save_month_checkpoint(
+            path,
+            month,
+            config,
+            completed_days[-1],
+            np.random.default_rng(1),
+            {},
+            identities,
+        )
+
+    def load():
+        return build._load_month_checkpoint(
+            path, month, config, 2023, 2024, None, np.random.default_rng(0), {}
+        )
+
+    save(source_identities)
+    last_completed_day, _ = load()
     assert last_completed_day == build.date(2024, 1, 2)
     assert checked_days == completed_days
 
     # A checkpoint written by the old loop also holds days outside the month.
-    stale_identities = {
-        **source_identities,
-        "2023-02-01": source_identities["2023-01-01"],
-    }
-    build._save_month_checkpoint(
-        tmp_path / "month_01.npz",
-        month,
-        config,
-        completed_days[-1],
-        rng,
-        {},
-        stale_identities,
-    )
-    with pytest.raises(ValueError, match="days outside the requested month"):
-        build._load_month_checkpoint(
-            tmp_path / "month_01.npz",
-            month,
-            config,
-            2023,
-            2024,
-            None,
-            np.random.default_rng(0),
-            {},
-        )
+    save({**source_identities, "2023-02-01": source_identities["2023-01-01"]})
+    with pytest.raises(ValueError, match="source days do not match"):
+        load()
+
+    missing_day = dict(source_identities)
+    del missing_day["2023-01-15"]
+    save(missing_day)
+    with pytest.raises(ValueError, match="source days do not match"):
+        load()
 
 
 def test_builder_rejects_incomplete_local_source(tmp_path, caplog):
