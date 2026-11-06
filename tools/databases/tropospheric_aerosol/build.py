@@ -1,8 +1,9 @@
 """Build the compact MERRA2 tropospheric aerosol reference catalogue.
 
-The default input is streamed from GES DISC with HTTP range requests. Earthdata
-Login credentials must be available through the user's netrc. ``--data-root``
-uses locally available granules instead.
+By default each day's granules are downloaded from GES DISC to temporary
+storage (``--no-stage-daily`` streams them with HTTP range requests instead).
+Earthdata Login credentials must be available through the user's netrc.
+``--data-root`` uses locally available granules instead.
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ import random
 import shutil
 import tempfile
 import time
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager, nullcontext
 from datetime import date, datetime, timezone
 from functools import partial
@@ -579,6 +580,9 @@ def _open_granule(location: Path | str, identity_callback=None):
             yield data
 
 
+_RETRYABLE_DOWNLOAD_STATUS = frozenset({401, 403, 429, 500, 502, 503, 504})
+
+
 def _download_granule(location: str, destination: Path) -> None:
     temporary_path = destination.with_name(f".{destination.name}.part")
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -641,13 +645,17 @@ def _download_granule(location: str, destination: Path) -> None:
                 if isinstance(exc, requests.HTTPError) and exc.response is not None
                 else None
             )
-            retryable = status in {429, 500, 502, 503, 504} or status is None
+            # 401/403 can come from an expired Earthdata session or signed
+            # redirect; each retry starts a fresh request and authentication.
+            retryable = status in _RETRYABLE_DOWNLOAD_STATUS or status is None
             if not retryable or attempt == 4:
                 raise
             delay = min(2**attempt, 30) + random.uniform(0, 1)
             logging.warning(
-                "Transient MERRA2 download failure (%s); retrying in %.1f s",
+                "Transient MERRA2 download failure for %s (%s: %s); retrying in %.1f s",
+                Path(location).name,
                 type(exc).__name__,
+                exc,
                 delay,
             )
             time.sleep(delay)
@@ -684,16 +692,24 @@ def _month_executor(workers: int) -> ProcessPoolExecutor:
 def _stage_day(
     day: date, directory: Path, checkpointing: bool
 ) -> tuple[dict, dict[str, Path]]:
-    """Download one remote day's granules into ``directory``."""
+    """Download one remote day's granules into ``directory``.
+
+    Failures are logged here, with a traceback, as soon as they happen: the
+    month worker only sees them when it reaches this day.
+    """
     logging.info("Staging MERRA2 granules for %s in %s", day.isoformat(), directory)
     identities = {}
     staged_locations = {}
-    for product, location in _source_locations(day, None).items():
-        if checkpointing:
-            identities[product] = _source_identity(location)
-        staged_path = directory / Path(location).name
-        _download_granule(location, staged_path)
-        staged_locations[product] = staged_path
+    try:
+        for product, location in _source_locations(day, None).items():
+            if checkpointing:
+                identities[product] = _source_identity(location)
+            staged_path = directory / Path(location).name
+            _download_granule(location, staged_path)
+            staged_locations[product] = staged_path
+    except Exception:
+        logging.exception("Failed to stage MERRA2 granules for %s", day.isoformat())
+        raise
     return identities, staged_locations
 
 
@@ -1864,11 +1880,40 @@ def build_catalogue(
     else:
         logging.info("Starting %d MERRA2 month worker processes", workers)
         with _month_executor(workers) as executor:
-            futures = [
-                executor.submit(_process_month, *arguments)
+            futures = {
+                executor.submit(_process_month, *arguments): arguments[0]
                 for arguments in month_arguments
-            ]
-            month_records = [future.result() for future in futures]
+            }
+            records_by_month = {}
+            failures = {}
+            # Report each month as it finishes. A failed month does not stop
+            # the others, so their checkpoints are complete for a resume.
+            for future in as_completed(futures):
+                month = futures[future]
+                try:
+                    records_by_month[month] = future.result()
+                except Exception as exc:
+                    logging.error(
+                        "MERRA2 month %02d failed (%s: %s); the remaining "
+                        "months continue so their checkpoints can be resumed",
+                        month,
+                        type(exc).__name__,
+                        exc,
+                        exc_info=exc,
+                    )
+                    failures[month] = exc
+                else:
+                    logging.info("MERRA2 month %02d complete", month)
+        if failures:
+            failed = min(failures)
+            msg = (
+                "MERRA2 month(s) "
+                + ", ".join(f"{month:02d}" for month in sorted(failures))
+                + " failed; resubmit with the same settings to resume from "
+                "checkpoints"
+            )
+            raise RuntimeError(msg) from failures[failed]
+        month_records = [records_by_month[month] for month in _MONTHS]
     records = [record for group in month_records for record in group]
     scenarios = [f"{band}_{loading}" for band in _BANDS for loading in _TIERS]
     months = list(_MONTHS)

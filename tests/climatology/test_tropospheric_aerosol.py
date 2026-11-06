@@ -7,6 +7,7 @@ import logging
 import os
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -1442,6 +1443,112 @@ def test_build_catalogue_rejects_species_that_do_not_sum_to_total(
             end_year=2024,
         )
     assert not (tmp_path / "output" / "tropospheric_aerosol_v1.nc").exists()
+
+
+def test_failed_month_is_reported_when_it_fails_and_others_finish(
+    optics_root, tmp_path, monkeypatch, caplog
+):
+    _, wavelengths = build.load_efficiency_profiles(optics_root)
+    finished = []
+
+    def records_for_month(month):
+        if month == 4:
+            msg = "staging failed"
+            raise OSError(msg)
+        finished.append(month)
+        return _fake_records(month, wavelengths)
+
+    _patch_catalogue_inputs(monkeypatch, tmp_path, records_for_month)
+    monkeypatch.setattr(build, "_month_executor", ThreadPoolExecutor)
+    caplog.set_level(logging.INFO)
+
+    with pytest.raises(RuntimeError, match=r"month\(s\) 04 failed") as error:
+        build.build_catalogue(
+            optics_root,
+            tmp_path / "output",
+            data_root=tmp_path,
+            start_year=2024,
+            end_year=2024,
+            workers=2,
+        )
+
+    assert isinstance(error.value.__cause__, OSError)
+    assert sorted(finished) == [1, 7, 10]
+    assert "MERRA2 month 04 failed (OSError: staging failed)" in caplog.text
+    assert "MERRA2 month 07 complete" in caplog.text
+    assert not (tmp_path / "output" / "tropospheric_aerosol_v1.nc").exists()
+
+
+class _FakeDownload:
+    def __init__(self, status, body=b"granule"):
+        self.status_code = status
+        self.body = body
+        self.headers = {"Content-Length": str(len(body))}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc_info):
+        return False
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            msg = f"HTTP {self.status_code}"
+            raise build.requests.HTTPError(msg, response=self)
+
+    def iter_content(self, chunk_size):  # noqa: ARG002
+        yield self.body
+
+
+@pytest.mark.parametrize("status", [401, 403, 503])
+def test_download_retries_authentication_and_server_errors(
+    tmp_path, monkeypatch, status
+):
+    responses = [_FakeDownload(status), _FakeDownload(200)]
+    monkeypatch.setattr(build.requests, "get", lambda *_a, **_k: responses.pop(0))
+    monkeypatch.setattr(build.time, "sleep", lambda _seconds: None)
+    destination = tmp_path / "granule.nc4"
+
+    build._download_granule("https://example.test/granule.nc4", destination)
+
+    assert destination.read_bytes() == b"granule"
+    assert not responses
+
+
+def test_download_does_not_retry_a_missing_granule(tmp_path, monkeypatch):
+    calls = []
+
+    def get(*_args, **_kwargs):
+        calls.append(1)
+        return _FakeDownload(404)
+
+    monkeypatch.setattr(build.requests, "get", get)
+    monkeypatch.setattr(build.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(build.requests.HTTPError):
+        build._download_granule(
+            "https://example.test/granule.nc4", tmp_path / "granule.nc4"
+        )
+    assert len(calls) == 1
+    assert not list(tmp_path.iterdir())
+
+
+def test_staging_failure_is_logged_when_it_happens(tmp_path, monkeypatch, caplog):
+    def fail(_location, _destination):
+        msg = "disk full"
+        raise OSError(msg)
+
+    monkeypatch.setattr(build, "_download_granule", fail)
+    caplog.set_level(logging.INFO)
+
+    with pytest.raises(OSError, match="disk full"):
+        build._stage_day(build.date(2024, 4, 10), tmp_path, checkpointing=False)
+
+    failure = next(
+        record for record in caplog.records if "Failed to stage" in record.message
+    )
+    assert "2024-04-10" in failure.message
+    assert failure.exc_info is not None
 
 
 def test_month_workers_run_in_separate_processes_with_parent_logging():
