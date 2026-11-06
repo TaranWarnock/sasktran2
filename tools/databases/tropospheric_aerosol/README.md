@@ -9,9 +9,10 @@ python tools/databases/tropospheric_aerosol/build.py \
   --optics-root /path/to/MERRA-2-Versions/v0.0.0
 ```
 
-By default, the builder streams 1980 through the last complete calendar year
-from GES DISC using HTTP range reads. Configure Earthdata Login credentials in
-the user's netrc; no full source granules are saved locally. To use existing
+By default, the builder reads 1980 through the last complete calendar year
+from GES DISC, downloading each day's granules to temporary storage and
+deleting them after processing (see "Daily staging" below). Configure
+Earthdata Login credentials in the user's netrc. To use existing
 granules instead, pass `--data-root` with `M2I1NXASM`, `M2I3NVAER`, and
 `M2I3NVASM` subdirectories. Pass `--start-year` and `--end-year` to pin the
 analysis period. Local builds fail on the first missing product day so that
@@ -69,8 +70,8 @@ The smoke job requests one CPU, 8 GB, and 30 minutes. Its output and report go
 under `~/scratch/output/sasktran/smoke-YYYY-MM-DD` by default. Change
 `TEST_DATE` to a date with available MERRA2 inputs.
 
-The job uses four concurrent month workers and streams GES DISC granules
-directly. Transient HTTP failures (429 and common 5xx responses, connection
+The job uses four concurrent month workers and downloads GES DISC granules
+one day at a time. Transient HTTP failures (429 and common 5xx responses, connection
 errors, and timeouts) get up to five attempts with backoff. If a GES DISC
 range request returns 403, the builder resolves a fresh signed URL and retries
 the range request. Persistent failures stop the job with the original
@@ -95,19 +96,25 @@ Checkpoints are deleted after the catalogue and report are written
 successfully. They are stored in the output directory, so choose a persistent
 scratch location rather than `$SLURM_TMPDIR`.
 
-If remote range reads are slow, set `STAGE_DAILY=1` when submitting the build
-job. This downloads each day's three granules to a temporary directory on the
-compute node (under `$SLURM_TMPDIR` when available), processes them locally,
-and removes them after processing. While a day is processed, the next day's
+### Daily staging
+
+By default (`--stage-daily`, or `STAGE_DAILY=1` in the Slurm job), the builder
+downloads each day's three granules to a temporary directory on the compute
+node (under `$SLURM_TMPDIR` when available), processes them locally, and
+removes them after processing. While a day is processed, the next day's
 granules download in the background, so downloads overlap with processing.
 Checkpoint source identities remain tied to the remote granules, so resume
 validation works after temporary files are deleted. Staging downloads each
 full granule (about 6.6 GB per day for the three products) and each worker
 holds up to two days at once, so four workers need about 55 GB of
-`$SLURM_TMPDIR`. Check available capacity before enabling it. For example:
+`$SLURM_TMPDIR`. Check available capacity before submitting.
+
+If temporary storage is too small, stream the granules with HTTP range reads
+instead (`--no-stage-daily`, or `STAGE_DAILY=0` in the Slurm job). Nothing is
+saved locally, but range reads are much slower. For example:
 
 ```bash
-STAGE_DAILY=1 bash tools/databases/tropospheric_aerosol/submit.sh \
+STAGE_DAILY=0 bash tools/databases/tropospheric_aerosol/submit.sh \
   --export=ALL,OPTICS_ROOT=/path/to/MERRA-2-Versions/v0.0.0,START_YEAR=2024,END_YEAR=2024
 ```
 

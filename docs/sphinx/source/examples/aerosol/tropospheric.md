@@ -104,10 +104,10 @@ disagree with the catalogue's.
 
 The compact runtime catalogue is built offline from MERRA2 products
 `M2I3NVAER`, `M2I3NVASM`, and `M2I1NXASM`, together with the five MERRA2 aerosol
-optical tables. By default the builder streams source granules from GES DISC
-using authenticated HTTP range reads; with `--stage-daily` it instead downloads
-each day's complete granules to temporary storage and deletes them after
-processing. Create
+optical tables. By default the builder downloads each day's source granules
+from GES DISC to temporary storage and deletes them after processing; with
+`--no-stage-daily` it instead streams them using authenticated HTTP range
+reads. Create
 an Earthdata Login netrc entry. For a local run, install the optional build
 dependencies:
 

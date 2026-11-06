@@ -802,6 +802,25 @@ def test_input_access_description_matches_how_inputs_were_read(tmp_path):
     assert "local" in build._input_access_description(tmp_path, True)
 
 
+@pytest.mark.parametrize(
+    ("flags", "expected"),
+    [([], True), (["--stage-daily"], True), (["--no-stage-daily"], False)],
+)
+def test_command_line_stages_daily_granules_by_default(
+    monkeypatch, tmp_path, flags, expected
+):
+    calls = []
+    monkeypatch.setattr(
+        build, "build_catalogue", lambda *args, **kwargs: calls.append(kwargs)
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        ["build.py", "--optics-root", str(tmp_path), "--output", str(tmp_path), *flags],
+    )
+    build.main()
+    assert calls[0]["stage_daily"] is expected
+
+
 @pytest.mark.parametrize("surface", [10.0, 545.0, -10.0])
 def test_conservative_grid_profile_preserves_tropospheric_aod(surface):
     # MERRA2 levels run top-down; the helper must not depend on that order.

@@ -1797,7 +1797,7 @@ def build_catalogue(
     reservoir_size: int = 50000,
     seed: int = 20261021,
     workers: int = 1,
-    stage_daily: bool = False,
+    stage_daily: bool = True,
 ) -> Path:
     if start_year < 1980 or end_year < start_year:
         msg = "MERRA2 years must satisfy 1980 <= start_year <= end_year"
@@ -1816,8 +1816,6 @@ def build_catalogue(
         end_year,
         workers,
     )
-    if stage_daily and data_root is not None:
-        logging.info("Daily staging is unnecessary for local MERRA2 inputs")
     logging.info("Loading MERRA2 optical tables from %s", optics_root)
     efficiencies, wavelengths_nm = load_efficiency_profiles(optics_root)
     logging.info("Loaded MERRA2 optical tables")
@@ -2111,7 +2109,7 @@ def main() -> None:
         type=Path,
         help=(
             "Local root containing M2I1NXASM, M2I3NVAER, and M2I3NVASM "
-            "directories; omit to stream from authenticated GES DISC"
+            "directories; omit to read from authenticated GES DISC"
         ),
     )
     parser.add_argument(
@@ -2128,8 +2126,13 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=20261021)
     parser.add_argument(
         "--stage-daily",
-        action="store_true",
-        help="Download each remote day's granules to temporary storage before processing",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Download each remote day's granules to temporary storage before "
+            "processing (default); --no-stage-daily streams them with HTTP "
+            "range reads instead"
+        ),
     )
     parser.add_argument(
         "--workers",

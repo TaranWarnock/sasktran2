@@ -26,7 +26,9 @@ BUILD_ARGS=(
     --workers "$WORKERS"
     --verbose
 )
-if [[ "${STAGE_DAILY:-0}" == "1" ]]; then
+if [[ "${STAGE_DAILY:-1}" == "1" ]]; then
     BUILD_ARGS+=(--stage-daily)
+else
+    BUILD_ARGS+=(--no-stage-daily)
 fi
 "$PYTHON" tools/databases/tropospheric_aerosol/build.py "${BUILD_ARGS[@]}"
