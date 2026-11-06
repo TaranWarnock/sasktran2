@@ -1279,49 +1279,84 @@ def _grid_humidity(
     return humidity
 
 
-def _read_column_spectrum(
+def _read_column_spectra(
     day: date,
-    time_index: int,
-    latitude_index: int,
-    longitude_index: int,
+    columns: list[tuple[int, int, int]],
     data_root: Path | None,
     geoid_undulation: xr.DataArray,
     efficiency_profiles: dict[str, tuple[np.ndarray, np.ndarray]],
     wavelengths_nm: np.ndarray,
+    *,
+    stage_daily: bool,
+    stager: _DayStager | None = None,
+) -> list[_ColumnProfiles]:
+    """Read ``(time, latitude, longitude)`` index columns from one day.
+
+    The day's granules are opened once, the same way as in the daily pass:
+    remote granules are downloaded first when ``stage_daily`` is set and
+    streamed with range requests otherwise.
+    """
+    with _open_daily_granules(
+        day,
+        data_root,
+        stage_daily=stage_daily,
+        checkpointing=False,
+        stager=stager,
+    ) as (_, aerosol, meteorology, tropopause):
+        return [
+            _column_spectrum(
+                aerosol,
+                meteorology,
+                tropopause,
+                time_index,
+                latitude_index,
+                longitude_index,
+                geoid_undulation,
+                efficiency_profiles,
+                wavelengths_nm,
+            )
+            for time_index, latitude_index, longitude_index in columns
+        ]
+
+
+def _column_spectrum(
+    aerosol: xr.Dataset,
+    meteorology: xr.Dataset,
+    tropopause: xr.Dataset,
+    time_index: int,
+    latitude_index: int,
+    longitude_index: int,
+    geoid_undulation: xr.DataArray,
+    efficiency_profiles: dict[str, tuple[np.ndarray, np.ndarray]],
+    wavelengths_nm: np.ndarray,
 ) -> _ColumnProfiles:
-    locations = _source_locations(day, data_root)
-    with (
-        _open_granule(locations["aerosol"]) as aerosol,
-        _open_granule(locations["meteorology"]) as meteorology,
-        _open_granule(locations["tropopause"]) as tropopause,
-    ):
-        aerosol_column = (
-            aerosol[_AEROSOL_VARIABLES]
-            .isel(time=time_index, lat=latitude_index, lon=longitude_index)
-            .load()
-        )
-        meteorology_column = (
-            meteorology[_METEOROLOGY_VARIABLES]
-            .isel(time=time_index, lat=latitude_index, lon=longitude_index)
-            .load()
-        )
-        timestamp = aerosol.time.values[time_index]
-        tropopause_index = np.flatnonzero(tropopause.time.values == timestamp)
-        if tropopause_index.size != 1:
-            msg = f"MERRA2 tropopause file has no exact sample for {timestamp}"
-            raise ValueError(msg)
-        tropopause_pressure = float(
-            tropopause.TROPPB.isel(
-                time=int(tropopause_index[0]),
-                lat=latitude_index,
-                lon=longitude_index,
-            ).values
-        )
-        latitude = float(aerosol.lat.values[latitude_index])
-        longitude = float(aerosol.lon.values[longitude_index])
-        surface_geopotential_height = (
-            float(meteorology_column.PHIS.values) / _STANDARD_GRAVITY
-        )
+    aerosol_column = (
+        aerosol[_AEROSOL_VARIABLES]
+        .isel(time=time_index, lat=latitude_index, lon=longitude_index)
+        .load()
+    )
+    meteorology_column = (
+        meteorology[_METEOROLOGY_VARIABLES]
+        .isel(time=time_index, lat=latitude_index, lon=longitude_index)
+        .load()
+    )
+    timestamp = aerosol.time.values[time_index]
+    tropopause_index = np.flatnonzero(tropopause.time.values == timestamp)
+    if tropopause_index.size != 1:
+        msg = f"MERRA2 tropopause file has no exact sample for {timestamp}"
+        raise ValueError(msg)
+    tropopause_pressure = float(
+        tropopause.TROPPB.isel(
+            time=int(tropopause_index[0]),
+            lat=latitude_index,
+            lon=longitude_index,
+        ).values
+    )
+    latitude = float(aerosol.lat.values[latitude_index])
+    longitude = float(aerosol.lon.values[longitude_index])
+    surface_geopotential_height = (
+        float(meteorology_column.PHIS.values) / _STANDARD_GRAVITY
+    )
     geoid_offset = float(
         _interpolate_geoid_undulation(
             geoid_undulation, np.array([latitude]), np.array([longitude])
@@ -1753,7 +1788,7 @@ def _process_month(
         if stager is not None:
             stager.close()
 
-    result = []
+    selections = []
     for band in _BANDS:
         reservoir = reservoirs[band]
         logging.info(
@@ -1768,38 +1803,78 @@ def _process_month(
                 quantile, half_width
             )
             timestamp = np.datetime_as_string(reservoir.time[index], unit="s")
-            selected_day = date.fromisoformat(timestamp[:10])
-            column = _read_column_spectrum(
-                selected_day,
-                int(reservoir.time_index[index]),
-                int(reservoir.latitude_index[index]),
-                int(reservoir.longitude_index[index]),
+            selections.append(
+                (band, loading, index, percentile, count, lower, upper, timestamp)
+            )
+
+    # Read the selected columns one day at a time, so a day chosen for several
+    # scenarios is opened (and downloaded) once.
+    selected_days = sorted({date.fromisoformat(item[-1][:10]) for item in selections})
+    column_stager = (
+        _DayStager(selected_days, checkpointing=False)
+        if stage_daily and data_root is None
+        else None
+    )
+    columns = {}
+    try:
+        for day in selected_days:
+            day_selections = [
+                item for item in selections if item[-1][:10] == day.isoformat()
+            ]
+            logging.info(
+                "Reading %d selected MERRA2 column(s) for month %02d from %s",
+                len(day_selections),
+                month,
+                day.isoformat(),
+            )
+            day_columns = _read_column_spectra(
+                day,
+                [
+                    (
+                        int(reservoirs[band].time_index[index]),
+                        int(reservoirs[band].latitude_index[index]),
+                        int(reservoirs[band].longitude_index[index]),
+                    )
+                    for band, _, index, *_ in day_selections
+                ],
                 data_root,
                 geoid_undulation,
                 efficiency_profiles,
                 wavelengths_nm,
+                stage_daily=stage_daily,
+                stager=column_stager,
             )
-            result.append(
-                {
-                    "scenario": f"{band}_{loading}",
-                    "month": month,
-                    **column._asdict(),
-                    "selection_aod_550nm": float(reservoir.aod[index]),
-                    "selection_percentile": percentile,
-                    "candidate_count": count,
-                    "candidate_window_aod_min": lower,
-                    "candidate_window_aod_max": upper,
-                    "selected_latitude_degrees": float(reservoir.latitude[index]),
-                    "selected_longitude_degrees": float(reservoir.longitude[index]),
-                    "selected_time": timestamp,
-                    "tropopause_altitude_m": float(
-                        reservoir.tropopause_altitude[index]
-                    ),
-                    "surface_altitude_m": float(reservoir.surface_altitude[index]),
-                    "sampled_candidate_count": int(reservoir.aod.size),
-                    "valid_candidate_count": int(reservoir.valid_candidates),
-                }
-            )
+            for (band, loading, *_), column in zip(
+                day_selections, day_columns, strict=True
+            ):
+                columns[band, loading] = column
+    finally:
+        if column_stager is not None:
+            column_stager.close()
+
+    result = []
+    for band, loading, index, percentile, count, lower, upper, timestamp in selections:
+        reservoir = reservoirs[band]
+        column = columns[band, loading]
+        result.append(
+            {
+                "scenario": f"{band}_{loading}",
+                "month": month,
+                **column._asdict(),
+                "selection_aod_550nm": float(reservoir.aod[index]),
+                "selection_percentile": percentile,
+                "candidate_count": count,
+                "candidate_window_aod_min": lower,
+                "candidate_window_aod_max": upper,
+                "selected_latitude_degrees": float(reservoir.latitude[index]),
+                "selected_longitude_degrees": float(reservoir.longitude[index]),
+                "selected_time": timestamp,
+                "tropopause_altitude_m": float(reservoir.tropopause_altitude[index]),
+                "surface_altitude_m": float(reservoir.surface_altitude[index]),
+                "sampled_candidate_count": int(reservoir.aod.size),
+                "valid_candidate_count": int(reservoir.valid_candidates),
+            }
+        )
     return result
 
 

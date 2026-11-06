@@ -765,12 +765,13 @@ def test_smoke_test_reads_and_processes_one_column(optics_root, monkeypatch):
     assert result["tropospheric_aod_550nm_min"] > 0
 
     efficiencies, wavelengths_nm = build.load_efficiency_profiles(optics_root)
-    column = build._read_column_spectrum(
-        build.date(2024, 1, 1),
+    column = build._column_spectrum(
+        aerosol,
+        meteorology,
+        tropopause,
         0,
         0,
         0,
-        Path("unused"),
         xr.DataArray(
             np.zeros((2, 2)),
             coords={"lat": [-90.0, 90.0], "lon": [0.0, 360.0]},
@@ -794,6 +795,48 @@ def test_smoke_test_reads_and_processes_one_column(optics_root, monkeypatch):
     )
     # The fake granules hold RH = 0.5 everywhere.
     assert_allclose(column.relative_humidity, 0.5)
+
+
+@pytest.mark.parametrize("stage_daily", [True, False])
+def test_selected_columns_open_granules_like_the_daily_pass(monkeypatch, stage_daily):
+    opened = []
+
+    @contextmanager
+    def open_daily_granules(day, data_root, **kwargs):
+        opened.append((day, data_root, kwargs))
+        yield {}, "aerosol", "meteorology", "tropopause"
+
+    monkeypatch.setattr(build, "_open_daily_granules", open_daily_granules)
+    monkeypatch.setattr(
+        build,
+        "_column_spectrum",
+        lambda _aer, _met, _trop, time_index, lat_index, lon_index, *_args: (
+            time_index,
+            lat_index,
+            lon_index,
+        ),
+    )
+    stager = object()
+
+    columns = build._read_column_spectra(
+        build.date(2024, 4, 10),
+        [(1, 2, 3), (4, 5, 6)],
+        None,
+        None,
+        {},
+        np.array([550.0]),
+        stage_daily=stage_daily,
+        stager=stager,
+    )
+
+    assert columns == [(1, 2, 3), (4, 5, 6)]
+    assert opened == [
+        (
+            build.date(2024, 4, 10),
+            None,
+            {"stage_daily": stage_daily, "checkpointing": False, "stager": stager},
+        )
+    ]
 
 
 def test_input_access_description_matches_how_inputs_were_read(tmp_path):
@@ -1204,11 +1247,13 @@ def test_month_checkpoint_restores_reservoir_and_skips_completed_days(
         pytest.fail("A completed month checkpoint should not reread MERRA2 data")
 
     monkeypatch.setattr(build, "_open_granule", unexpected_source_read)
-    monkeypatch.setattr(
-        build,
-        "_read_column_spectrum",
-        lambda *_args, **_kwargs: _fake_column(np.array([550.0])),
-    )
+    column_reads = []
+
+    def read_column_spectra(day, columns, *_args, stage_daily, stager):
+        column_reads.append((day, len(columns), stage_daily, stager))
+        return [_fake_column(np.array([550.0])) for _ in columns]
+
+    monkeypatch.setattr(build, "_read_column_spectra", read_column_spectra)
     records = build._process_month(
         month,
         2024,
@@ -1225,8 +1270,16 @@ def test_month_checkpoint_restores_reservoir_and_skips_completed_days(
         42,
         checkpoint_path,
         config,
+        stage_daily=True,
     )
     assert len(records) == len(build._BANDS) * len(build._TIERS)
+    # Every selection is on 2024-01-01, so that day is read once for all of them.
+    assert len(column_reads) == 1
+    day, column_count, stage_daily, stager = column_reads[0]
+    assert day == build.date(2024, 1, 1)
+    assert column_count == len(records)
+    assert stage_daily is True
+    assert isinstance(stager, build._DayStager)
 
 
 def test_multi_year_checkpoint_validates_only_days_in_the_month(tmp_path, monkeypatch):
