@@ -98,12 +98,13 @@ scratch location rather than `$SLURM_TMPDIR`.
 If remote range reads are slow, set `STAGE_DAILY=1` when submitting the build
 job. This downloads each day's three granules to a temporary directory on the
 compute node (under `$SLURM_TMPDIR` when available), processes them locally,
-and removes them before moving to the next day. Checkpoint source identities
-remain tied to the remote granules, so resume validation works after temporary
-files are deleted. Staging downloads each full granule and needs temporary
-space for the three files per active worker; with four workers, up to four days
-may be staged at once. Check available `$SLURM_TMPDIR` capacity before enabling
-it. For example:
+and removes them after processing. While a day is processed, the next day's
+granules download in the background, so downloads overlap with processing.
+Checkpoint source identities remain tied to the remote granules, so resume
+validation works after temporary files are deleted. Staging downloads each
+full granule (about 6.6 GB per day for the three products) and each worker
+holds up to two days at once, so four workers need about 55 GB of
+`$SLURM_TMPDIR`. Check available capacity before enabling it. For example:
 
 ```bash
 STAGE_DAILY=1 bash tools/databases/tropospheric_aerosol/submit.sh \
@@ -131,8 +132,11 @@ bash tools/databases/tropospheric_aerosol/submit.sh \
 ```
 
 For local runs, install the optional `merra2-build` dependencies and set
-`--workers` to process the four climatology months concurrently. Keep the
-worker count within the memory and CPU allocation.
+`--workers` to process the four climatology months concurrently. Month workers
+are separate processes: as threads they serialized on Python's GIL and h5py's
+global HDF5 lock (four threads ran about 1.2x faster than one; four processes
+about 3.2x). More than four workers gives no further speed-up. Keep the worker
+count within the memory and CPU allocation.
 Set `OUTPUT_ROOT` before invoking `submit.sh` to use another location for logs;
 set `OUTPUT_DIR` via `--export` to override the default catalogue directory.
 

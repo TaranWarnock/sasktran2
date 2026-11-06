@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import logging
+import os
 import sys
 import threading
 from contextlib import contextmanager
@@ -1421,3 +1423,72 @@ def test_build_catalogue_rejects_species_that_do_not_sum_to_total(
             end_year=2024,
         )
     assert not (tmp_path / "output" / "tropospheric_aerosol_v1.nc").exists()
+
+
+def test_month_workers_run_in_separate_processes_with_parent_logging():
+    root = logging.getLogger()
+    previous_level = root.level
+    root.setLevel(logging.INFO)
+    try:
+        with build._month_executor(2) as executor:
+            child_pid = executor.submit(os.getpid).result()
+            child_level = executor.submit(root.getEffectiveLevel).result()
+    finally:
+        root.setLevel(previous_level)
+    assert child_pid != os.getpid()
+    assert child_level == logging.INFO
+
+
+def _fake_stage_day(started, fail_on=None):
+    def stage(day, directory, _checkpointing):
+        started[day] = True
+        if day == fail_on:
+            msg = f"download failed for {day}"
+            raise OSError(msg)
+        path = directory / f"{day:%Y%m%d}.nc4"
+        path.write_bytes(b"granule")
+        return {}, dict.fromkeys(build._PRODUCTS, path)
+
+    return stage
+
+
+def test_day_stager_downloads_the_next_day_while_the_current_day_is_open(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("SLURM_TMPDIR", str(tmp_path))
+    started = {}
+    monkeypatch.setattr(build, "_stage_day", _fake_stage_day(started))
+    days = [build.date(2024, 1, day) for day in (1, 2, 3)]
+    stager = build._DayStager(days, checkpointing=False)
+    try:
+        for index, day in enumerate(days):
+            with stager.staged(day) as (_identities, paths):
+                assert paths["aerosol"].read_bytes() == b"granule"
+                if index + 1 < len(days):
+                    # The next day's download starts before this day is done.
+                    next_day = days[index + 1]
+                    for _ in range(100):
+                        if next_day in started:
+                            break
+                        threading.Event().wait(0.05)
+                    assert next_day in started
+            assert not paths["aerosol"].exists()
+    finally:
+        stager.close()
+    assert list(started) == days
+    assert not list(tmp_path.glob("sasktran2-merra2-*"))
+
+
+def test_day_stager_cleans_up_after_a_failed_download(tmp_path, monkeypatch):
+    monkeypatch.setenv("SLURM_TMPDIR", str(tmp_path))
+    days = [build.date(2024, 1, day) for day in (1, 2, 3)]
+    monkeypatch.setattr(build, "_stage_day", _fake_stage_day({}, fail_on=days[1]))
+    stager = build._DayStager(days, checkpointing=False)
+    try:
+        with stager.staged(days[0]):
+            pass
+        with pytest.raises(OSError, match="download failed"), stager.staged(days[1]):
+            pass
+    finally:
+        stager.close()
+    assert not list(tmp_path.glob("sasktran2-merra2-*"))
