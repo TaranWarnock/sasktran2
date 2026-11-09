@@ -80,8 +80,14 @@ aerosol.scenarios(month=10)[
 ]
 ```
 
-The profile helper returns extinction on its packaged altitude grid or
-interpolates to a caller-provided grid. Profile altitudes are geometric heights
+The profile helper returns extinction on its packaged 250 m altitude grid or
+remaps it to a caller-provided grid. The remap conserves AOD: each level gets
+the catalogue AOD in its trapezoid cell divided by the cell width, so the
+trapezoid integral over any grid that spans the surface to the tropopause
+equals the catalogue column AOD. Extinction is zero below the surface and
+above the tropopause, and the `region` variable flags those levels as -1 and
+0 (1 marks the troposphere). `tropospheric_aod` is the trapezoid integral of
+the returned profile. Profile altitudes are geometric heights
 above the WGS84 ellipsoid: MERRA2 geopotential heights are converted using
 latitude-dependent gravity and Earth radius, then offset by EGM2008 geoid
 undulation. The profile does not extend aerosol above the tropopause.

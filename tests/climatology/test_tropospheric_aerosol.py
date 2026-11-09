@@ -19,6 +19,7 @@ import sasktran2 as sk
 import xarray as xr
 from numpy.testing import assert_allclose, assert_array_equal
 from sasktran2.climatology import tropospheric_aerosol as aerosol
+from sasktran2.database import tropospheric_aerosol as database
 from sasktran2.optical.base import OpticalProperty, OpticalQuantities
 
 _BUILD_PATH = (
@@ -171,6 +172,188 @@ def test_load_scenarios_and_profile(catalogue, catalogue_path):
     )
     assert result.attrs["source_tropopause_field"] == "TROPPB"
     assert float(result.attrs["extinction_wavelength_nm"]) == 550
+
+
+@pytest.fixture
+def offgrid_catalogue(catalogue):
+    # Like the builder's output: the surface and tropopause fall between
+    # catalogue levels, and levels outside them are zero.
+    catalogue = catalogue.copy(deep=True)
+    catalogue["surface_altitude_m"][:] = 1300.0
+    catalogue["tropopause_altitude_m"][:] = 11700.0
+    outside = (catalogue.altitude_m < 1300.0) | (catalogue.altitude_m > 11700.0)
+    catalogue["extinction_per_m"] = catalogue.extinction_per_m.where(~outside, 0.0)
+    catalogue.extinction_per_m.attrs["units"] = "m-1"
+    return catalogue
+
+
+@pytest.fixture
+def offgrid_catalogue_path(offgrid_catalogue, tmp_path):
+    path = tmp_path / "offgrid.nc"
+    offgrid_catalogue.to_netcdf(path)
+    return path
+
+
+def _catalogue_aod(catalogue, wavelength_nm=550.0):
+    source = catalogue.sel(scenario="tropical_typical", month=4)
+    return np.trapezoid(
+        source.extinction_per_m.sel(wavelength_nm=wavelength_nm), source.altitude_m
+    )
+
+
+@pytest.mark.parametrize("spacing", [10.0, 37.0, 250.0, 700.0, 2500.0])
+def test_profile_conserves_catalogue_aod_on_any_grid(
+    offgrid_catalogue, offgrid_catalogue_path, spacing
+):
+    altitudes = np.arange(-500.0, 25000.0, spacing)
+    result = aerosol.profile(
+        "tropical_typical",
+        month=4,
+        altitudes_m=altitudes,
+        path=offgrid_catalogue_path,
+    )
+    extinction = result.extinction_per_m.values
+    assert_allclose(
+        np.trapezoid(extinction, altitudes),
+        _catalogue_aod(offgrid_catalogue),
+        rtol=1e-12,
+    )
+    assert (extinction >= 0).all()
+    assert not extinction[(altitudes < 1300.0) | (altitudes > 11700.0)].any()
+
+
+def test_profile_reproduces_catalogue_on_catalogue_grid(
+    offgrid_catalogue, offgrid_catalogue_path
+):
+    source = offgrid_catalogue.sel(scenario="tropical_typical", month=4)
+    for wavelength in source.wavelength_nm.values:
+        for altitudes in (None, source.altitude_m.values):
+            result = aerosol.profile(
+                "tropical_typical",
+                month=4,
+                wavelength_nm=wavelength,
+                altitudes_m=altitudes,
+                path=offgrid_catalogue_path,
+            )
+            assert_allclose(
+                result.extinction_per_m.values,
+                source.extinction_per_m.sel(wavelength_nm=wavelength).values,
+                rtol=1e-12,
+                atol=1e-25,
+            )
+
+
+def test_tropospheric_aod_integrates_the_returned_profile(
+    offgrid_catalogue, offgrid_catalogue_path
+):
+    for top in (6000.0, 20000.0):
+        altitudes = np.arange(0.0, top + 1.0, 10.0)
+        result = aerosol.profile(
+            "tropical_typical",
+            month=4,
+            altitudes_m=altitudes,
+            path=offgrid_catalogue_path,
+        )
+        assert_allclose(
+            float(result.tropospheric_aod),
+            np.trapezoid(result.extinction_per_m.values, altitudes),
+            rtol=1e-12,
+        )
+    # The 0-6 km grid misses the upper troposphere; the full grid does not.
+    assert float(result.tropospheric_aod) == pytest.approx(
+        _catalogue_aod(offgrid_catalogue), rel=1e-12
+    )
+
+
+def test_profile_needs_a_tropospheric_level(offgrid_catalogue_path):
+    with pytest.raises(ValueError, match="no level between the surface"):
+        aerosol.profile(
+            "tropical_typical",
+            month=4,
+            altitudes_m=[0.0, 1000.0, 12000.0],
+            path=offgrid_catalogue_path,
+        )
+
+
+def test_region_flags_distinguish_below_surface_and_above_tropopause(
+    offgrid_catalogue_path,
+):
+    result = aerosol.profile(
+        "tropical_typical",
+        month=4,
+        altitudes_m=[0.0, 1299.0, 1300.0, 11700.0, 11701.0, 20000.0],
+        path=offgrid_catalogue_path,
+    )
+    assert_array_equal(result.region.values, [-1, -1, 1, 1, 0, 0])
+    assert result.region.attrs["flag_values"] == [-1, 0, 1]
+    assert (
+        result.region.attrs["flag_meanings"]
+        == "below_surface above_tropopause troposphere"
+    )
+
+
+def _count_hashes(monkeypatch):
+    calls = []
+    original = database._sha256
+
+    def counting_sha256(path):
+        calls.append(Path(path))
+        return original(path)
+
+    monkeypatch.setattr(database, "_sha256", counting_sha256)
+    monkeypatch.setattr(aerosol, "_sha256", counting_sha256)
+    return calls
+
+
+def test_load_dataset_caches_each_file_until_it_changes(
+    catalogue, catalogue_path, monkeypatch
+):
+    calls = _count_hashes(monkeypatch)
+    first = aerosol.load_dataset(path=catalogue_path)
+    first["extinction_per_m"][:] = -1.0
+    second = aerosol.load_dataset(path=catalogue_path)
+    assert len(calls) == 1
+    xr.testing.assert_identical(second, aerosol.load_dataset(path=catalogue_path))
+    assert (second.extinction_per_m.values >= 0).all()
+
+    changed = catalogue.copy(deep=True)
+    changed["extinction_per_m"] = 2 * changed.extinction_per_m
+    changed.attrs["note"] = "rebuilt"
+    changed.to_netcdf(catalogue_path)
+    status = catalogue_path.stat()
+    os.utime(catalogue_path, ns=(status.st_atime_ns, status.st_mtime_ns + 10**9))
+    reloaded = aerosol.load_dataset(path=catalogue_path)
+    assert len(calls) == 2
+    assert reloaded.attrs["note"] == "rebuilt"
+    assert_allclose(reloaded.extinction_per_m, 2 * second.extinction_per_m)
+    assert (
+        reloaded.attrs["source_sha256"]
+        == hashlib.sha256(catalogue_path.read_bytes()).hexdigest()
+    )
+
+
+def test_verified_catalogue_is_hashed_once_until_it_changes(
+    catalogue, tmp_path, monkeypatch
+):
+    cache = tmp_path / "climatology" / "tropospheric_aerosol" / "v1"
+    cache.mkdir(parents=True)
+    cached_file = cache / "tropospheric_aerosol_v1.nc"
+    catalogue.to_netcdf(cached_file)
+    checksum = hashlib.sha256(cached_file.read_bytes()).hexdigest()
+    monkeypatch.setattr(database, "_FILES", {"v1": (cached_file.name, checksum)})
+    calls = _count_hashes(monkeypatch)
+
+    data = aerosol.load_dataset(db_root=tmp_path)
+    assert data.attrs["source_mode"] == "verified_cache"
+    assert len(calls) == 2  # verification and the recorded source checksum
+    aerosol.scenarios(db_root=tmp_path)
+    aerosol.profile("tropical_typical", month=4, db_root=tmp_path)
+    assert len(calls) == 2
+
+    with cached_file.open("ab") as stream:
+        stream.write(b"\0")
+    with pytest.raises(OSError, match="checksum mismatch"):
+        aerosol.load_dataset(db_root=tmp_path)
 
 
 @pytest.mark.parametrize(

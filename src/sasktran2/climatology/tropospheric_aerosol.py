@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 import xarray as xr
 from scipy.integrate import trapezoid
+from scipy.interpolate import PchipInterpolator
 
 import sasktran2 as sk
 from sasktran2.constituent import ExtinctionScatterer
@@ -76,6 +77,10 @@ def load_dataset(
     ``path`` loads an explicit local NetCDF file and bypasses the packaged
     checksum. ``db_root`` selects the cache directory. These options are
     mutually exclusive.
+
+    Each file is read, validated and hashed once per process. Later calls
+    return a copy of the in-memory catalogue for as long as the file's
+    modification time and size are unchanged.
     """
     if version != "v1":
         msg = f"Unsupported catalogue version {version!r}; available: ['v1']"
@@ -83,20 +88,49 @@ def load_dataset(
     if path is not None and db_root is not None:
         msg = "Specify either path or db_root, not both"
         raise ValueError(msg)
-    source = (
-        Path(path)
-        if path is not None
-        else TroposphericAerosolDatabase(version, db_root).path()
-    )
-    with xr.open_dataset(source) as data:
-        result = data.load()
-    _validate_catalogue(result)
-    result.attrs.update(
-        source_file=source.name,
-        source_sha256=_sha256(source),
-        source_mode="local" if path is not None else "verified_cache",
-    )
-    return result
+    mode = "local" if path is not None else "verified_cache"
+    if path is not None:
+        source = Path(path)
+    else:
+        database = TroposphericAerosolDatabase(version, db_root)
+        # A cached copy was verified when it was loaded; verify again only
+        # when the file is new or has changed.
+        source = database._db_root / database._filename
+        if _cached(source, mode) is None:
+            source = database.path()
+    cached = _cached(source, mode)
+    if cached is None:
+        signature = _file_signature(source)
+        with xr.open_dataset(source) as data:
+            cached = data.load()
+        _validate_catalogue(cached)
+        cached.attrs.update(
+            source_file=source.name,
+            source_sha256=_sha256(source),
+            source_mode=mode,
+        )
+        _CATALOGUE_CACHE[(str(source.resolve()), mode)] = (signature, cached)
+    return cached.copy(deep=True)
+
+
+_CATALOGUE_CACHE: dict[tuple[str, str], tuple[tuple[int, int], xr.Dataset]] = {}
+
+
+def _file_signature(path: Path) -> tuple[int, int]:
+    status = path.stat()
+    return status.st_mtime_ns, status.st_size
+
+
+def _cached(path: Path, mode: str) -> xr.Dataset | None:
+    """Return the cached catalogue for ``path`` if the file is unchanged."""
+    try:
+        signature = _file_signature(path)
+    except OSError:
+        return None
+    entry = _CATALOGUE_CACHE.get((str(path.resolve()), mode))
+    if entry is None or entry[0] != signature:
+        return None
+    return entry[1]
 
 
 def _validate_catalogue(data: xr.Dataset) -> None:
@@ -204,6 +238,20 @@ def profile(
     ``month`` must be one of 1, 4, 7, or 10. The default extinction wavelength
     is 550 nm; other wavelengths may be selected within the catalogue's
     spectral range. No stratospheric extension is applied.
+
+    ``altitudes_m`` defaults to the catalogue grid, where the catalogue values
+    are returned unchanged. Other grids receive a conservative remap: each
+    level's extinction is the catalogue AOD within its trapezoid cell divided
+    by the cell width, using a monotone spline of the cumulative AOD.
+    Extinction is zero below the surface and above the tropopause, and the
+    AOD of cells that cross those boundaries moves to the nearest
+    tropospheric level. The trapezoid integral of ``extinction_per_m`` over
+    ``altitude_m`` therefore equals the catalogue column AOD whenever the grid
+    spans the surface to the tropopause; ``tropospheric_aod`` is that integral.
+    At least one level must lie between the surface and the tropopause.
+
+    ``region`` flags each level as below the surface (-1), above the
+    tropopause (0) or in the troposphere (1).
     """
     return _profile(
         load_dataset(version, path=path, db_root=db_root),
@@ -212,6 +260,62 @@ def profile(
         wavelength_nm,
         altitudes_m,
     )
+
+
+def _cell_bounds(altitudes: np.ndarray) -> np.ndarray:
+    """Bounds of the trapezoid-rule cells around each level."""
+    return np.concatenate(
+        ([altitudes[0]], 0.5 * (altitudes[1:] + altitudes[:-1]), [altitudes[-1]])
+    )
+
+
+def _conservative_remap(
+    source_altitudes: np.ndarray,
+    source_extinction: np.ndarray,
+    target: np.ndarray,
+    surface: float,
+    tropopause: float,
+) -> np.ndarray:
+    """Remap a catalogue profile to ``target`` via its cumulative AOD.
+
+    Catalogue extinction is AOD per trapezoid cell (the builder's
+    representation). Each tropospheric level's cell AOD is placed in its cell,
+    with the outermost cells clipped to the surface and tropopause, and the
+    cumulative AOD is interpolated with a monotone (PCHIP) spline. Each target
+    level receives the AOD in its own trapezoid cell; cells of levels below
+    the surface or above the tropopause fold into the nearest tropospheric
+    level, whose extinction is the cell AOD divided by the cell width.
+
+    The result is zero outside the surface-tropopause range, nonnegative, and
+    its trapezoid integral equals the catalogue AOD within the target's
+    altitude range. On the catalogue grid it reproduces the catalogue.
+    """
+    valid_source = (source_altitudes >= surface) & (source_altitudes <= tropopause)
+    valid_target = (target >= surface) & (target <= tropopause)
+    if not valid_source.any() or not valid_target.any():
+        grid = "Catalogue" if not valid_source.any() else "altitudes_m"
+        msg = (
+            f"{grid} has no level between the surface ({surface:g} m) and "
+            f"tropopause ({tropopause:g} m)"
+        )
+        raise ValueError(msg)
+    first, last = np.flatnonzero(valid_source)[[0, -1]]
+    source_bounds = _cell_bounds(source_altitudes)
+    bounds = source_bounds[first : last + 2].copy()
+    bounds[0] = min(max(surface, source_altitudes[0]), source_altitudes[first])
+    bounds[-1] = max(min(tropopause, source_altitudes[-1]), source_altitudes[last])
+    source_aod = source_extinction * np.diff(source_bounds)
+    cumulative = np.concatenate(([0.0], np.cumsum(source_aod[first : last + 1])))
+    spline = PchipInterpolator(bounds, cumulative)
+    target_bounds = _cell_bounds(target)
+    cell_aod = np.maximum(
+        np.diff(spline(np.clip(target_bounds, bounds[0], bounds[-1]))), 0.0
+    )
+    first, last = np.flatnonzero(valid_target)[[0, -1]]
+    cell_aod[first] += cell_aod[:first].sum()
+    cell_aod[last] += cell_aod[last + 1 :].sum()
+    cell_aod[~valid_target] = 0.0
+    return cell_aod / np.diff(target_bounds)
 
 
 def _profile(
@@ -244,10 +348,13 @@ def _profile(
     target = (
         source_altitudes if altitudes_m is None else _grid(altitudes_m, "altitudes_m")
     )
-    prepared = np.interp(target, source_altitudes, source_extinction, left=0, right=0)
     tropopause = float(case.tropopause_altitude_m)
     surface = float(case.surface_altitude_m)
-    prepared[(target < surface) | (target > tropopause)] = 0
+    prepared = _conservative_remap(
+        source_altitudes, source_extinction, target, surface, tropopause
+    )
+    below = target < surface
+    above = target > tropopause
     result = xr.Dataset(
         {
             "extinction_per_m": (
@@ -257,15 +364,23 @@ def _profile(
             ),
             "region": (
                 "altitude_m",
-                ((target >= surface) & (target <= tropopause)).astype(np.int8),
+                np.where(below, -1, np.where(above, 0, 1)).astype(np.int8),
                 {
-                    "flag_values": [0, 1],
-                    "flag_meanings": "above_tropopause troposphere",
+                    "flag_values": [-1, 0, 1],
+                    "flag_meanings": "below_surface above_tropopause troposphere",
                 },
             ),
             "tropospheric_aod": xr.DataArray(
-                float(trapezoid(source_extinction, source_altitudes)),
-                attrs={"units": "1", "wavelength_nm": wavelength},
+                float(trapezoid(prepared, target)),
+                attrs={
+                    "units": "1",
+                    "wavelength_nm": wavelength,
+                    "description": (
+                        "Trapezoid integral of extinction_per_m over altitude_m. "
+                        "Equals the catalogue column AOD when altitude_m spans "
+                        "the surface to the tropopause."
+                    ),
+                },
             ),
         },
         coords={"altitude_m": ("altitude_m", target, {"units": "m"})},
