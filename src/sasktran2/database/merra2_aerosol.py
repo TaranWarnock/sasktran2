@@ -41,6 +41,14 @@ _OPTICS_SHA256: dict[str, str | None] = {
     "optics_SU.v1_3.nc": None,
 }
 
+# The tables store wavelength as float32 metres (e.g. 39999.999 nm for 40 um).
+# Round to the catalogue builder's 0.01 nm grid so catalogue wavelengths fall
+# on table wavelengths; must match _WAVELENGTH_DECIMALS_NM in the builder.
+_WAVELENGTH_DECIMALS_NM = 2
+
+# Bump when generate() output changes, so stale cached tables are not reused
+_CACHE_FORMAT = 2
+
 # Order of the scattering matrix elements along the MERRA2 ``nPol`` dimension
 _P11 = 0
 _GREEK_ZERO = ("lm_a2", "lm_a3", "lm_a4", "lm_b1", "lm_b2")
@@ -197,7 +205,9 @@ class OpticalDatabaseMERRA2Aerosol(
         self._max_legendre_moments = max_legendre_moments
 
         moments = "all" if max_legendre_moments is None else max_legendre_moments
-        identifier = f"{input_file.stem}_bin{self._radius_bin}_mom{moments}"
+        identifier = (
+            f"{input_file.stem}_bin{self._radius_bin}_mom{moments}_v{_CACHE_FORMAT}"
+        )
 
         CachedDatabase.__init__(
             self, db_root=db_root, rel_path=Path("cross_sections") / "merra2"
@@ -230,7 +240,10 @@ class OpticalDatabaseMERRA2Aerosol(
         out = out.rename({"lambda": "wavelength_nm", "rh": "relative_humidity"})
         out = out.rename_dims({"nMom": "legendre"}).astype(np.float64)
         out = out.assign_coords(
-            wavelength_nm=ds["lambda"].to_numpy().astype(np.float64) * 1e9,
+            wavelength_nm=np.round(
+                ds["lambda"].to_numpy().astype(np.float64) * 1e9,
+                _WAVELENGTH_DECIMALS_NM,
+            ),
             relative_humidity=ds["rh"].to_numpy().astype(np.float64),
         )
         for name in _GREEK_ZERO:

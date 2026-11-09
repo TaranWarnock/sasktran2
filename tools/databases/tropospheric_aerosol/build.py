@@ -46,6 +46,21 @@ _TIERS = {
     "elevated": (0.90, 0.03),
     "extreme": (0.99, 0.005),
 }
+# Units of the scenario/month metadata variables. selected_time has none:
+# xarray writes its own time units when encoding datetimes.
+_METADATA_UNITS = {
+    "selection_aod_550nm": "1",
+    "selection_percentile": "percent",
+    "candidate_count": "1",
+    "candidate_window_aod_min": "1",
+    "candidate_window_aod_max": "1",
+    "selected_latitude_degrees": "degrees_north",
+    "selected_longitude_degrees": "degrees_east",
+    "tropopause_altitude_m": "m",
+    "surface_altitude_m": "m",
+    "sampled_candidate_count": "1",
+    "valid_candidate_count": "1",
+}
 _COMPONENTS = {
     "SO4": ("optics_SU.v1_3.nc", 0),
     **{f"DU{i:03d}": ("optics_DU.v14_2.nc", i - 1) for i in range(1, 6)},
@@ -1218,13 +1233,23 @@ class _WeightedReservoir:
                 f"{quantile - half_width:.3f}-{quantile + half_width:.3f}"
             )
             raise ValueError(msg)
-        group_profiles = self.profiles[group]
-        positive = group_profiles[group_profiles > 0]
+        # Compare profile shapes, each normalized by its own AOD. Scoring the
+        # profiles themselves favoured the lowest-loading members: deviations
+        # in log1p(extinction / scale) shrink with extinction, so 42 of 48
+        # selections in the 2024 catalogue fell below the window centre.
+        group_aod = self.aod[group]
+        group_shapes = np.divide(
+            self.profiles[group],
+            group_aod[:, None],
+            out=np.zeros_like(self.profiles[group]),
+            where=group_aod[:, None] > 0,
+        )
+        positive = group_shapes[group_shapes > 0]
         if positive.size == 0:
             msg = "Loading tier candidate group has no positive extinction"
             raise ValueError(msg)
         scale = float(np.median(positive))
-        transformed = np.log1p(group_profiles / scale)
+        transformed = np.log1p(group_shapes / scale)
         median_profile = np.median(transformed, axis=0)
         score = np.mean((transformed - median_profile) ** 2, axis=1)
         selected_index = int(group[np.argmin(score)])
@@ -2128,6 +2153,7 @@ def build_catalogue(
                     np.asarray(values).astype(
                         "datetime64[ns]" if name == "selected_time" else float
                     ),
+                    {"units": _METADATA_UNITS[name]} if name in _METADATA_UNITS else {},
                 )
                 for name, values in metadata.items()
             },
@@ -2163,7 +2189,7 @@ def build_catalogue(
             "reference_wavelength_nm": 550.0,
             "loading_percentile_method": "Area-weighted individual columns; weighted reservoir sample",
             "loading_windows": json.dumps(_TIERS, sort_keys=True),
-            "profile_selection": "Actual candidate nearest group median log1p(extinction / median_positive_extinction)",
+            "profile_selection": "Actual candidate nearest group median log1p(shape / median_positive_shape), shape = extinction / column AOD",
             "candidate_sampling_seed": seed,
             "candidate_reservoir_size": reservoir_size,
             "profile_altitude_grid": (

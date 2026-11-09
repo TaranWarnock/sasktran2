@@ -40,7 +40,9 @@ bands are southern midlatitudes (`sh_midlat`, 55–35°S), the tropics (`tropica
 Month selection is exact and follows the CAIRT scenario months: 1, 4, 7, or 10.
 The loading levels use area-weighted monthly tropospheric AOD percentiles. Each
 case is an actual MERRA2 column selected from a narrow percentile window and
-chosen to represent the group's median vertical extinction profile:
+chosen to represent the group's median vertical profile shape (extinction
+divided by column AOD), so the choice does not favour lower or higher loading
+within the window:
 
 | Loading | AOD percentile window |
 | --- | --- |

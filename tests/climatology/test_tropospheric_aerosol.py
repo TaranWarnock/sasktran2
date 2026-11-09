@@ -1127,6 +1127,33 @@ def test_area_weighted_reservoir_keeps_representative_profiles():
     assert lower <= reservoir.aod[index] <= upper
 
 
+def test_selection_is_not_biased_toward_low_loading_within_the_window():
+    # Profile shapes here don't depend on loading, so the selected column should
+    # sit anywhere in its percentile window. Scoring unnormalized profiles put
+    # selections low: mean position -0.25 of the half-width here (with this
+    # seed; about +-0.05 standard error), -0.52 in the 2024 catalogue.
+    rng = np.random.default_rng(3)
+    altitudes = build._TARGET_ALTITUDES_M
+    positions = []
+    for _ in range(30):
+        size = 5000
+        aod = rng.lognormal(np.log(0.1), 0.7, size)
+        scale_height = rng.uniform(800.0, 3000.0, size)[:, None]
+        shape = np.exp(-altitudes / scale_height) * rng.lognormal(
+            0.0, 0.4, (size, altitudes.size)
+        )
+        shape[:, altitudes > 12000.0] = 0.0
+        shape /= np.trapezoid(shape, altitudes, axis=1)[:, None]
+        reservoir = build._WeightedReservoir(size, rng)
+        reservoir.aod = aod
+        reservoir.profiles = aod[:, None] * shape
+        reservoir.valid_candidates = size
+        for quantile, half_width in build._TIERS.values():
+            _, percentile, *_ = reservoir.select_tier(quantile, half_width)
+            positions.append((percentile / 100 - quantile) / half_width)
+    assert abs(np.mean(positions)) < 0.15
+
+
 def test_month_checkpoint_restores_reservoir_and_skips_completed_days(
     tmp_path, monkeypatch
 ):
@@ -1475,6 +1502,45 @@ def test_build_catalogue_writes_species_extinction_and_humidity(
             "species_extinction_550nm_per_m",
             "relative_humidity",
         } & set(scenario)
+
+
+def test_builder_catalogue_loads_and_builds_the_default_constituent(
+    tmp_path, monkeypatch
+):
+    # The library tests use a hand-written catalogue; this checks the builder's
+    # own output against the library, with tables storing wavelength as float32
+    # metres like the real ones (40 um reads back as 39999.999 nm).
+    monkeypatch.setenv("SASKTRAN2_DATABASE_ROOT", str(tmp_path / "database"))
+    optics = tmp_path / "optics"
+    optics.mkdir()
+    wavelengths_m = np.array([250e-9, 550e-9, 40e-6])
+    _write_optics_tables(
+        optics,
+        {
+            **dict.fromkeys(build._OPTICS_FILES, wavelengths_m.astype(np.float32)),
+            "optics_SS.v3_3.nc": wavelengths_m,
+        },
+    )
+    _, wavelengths = build.load_efficiency_profiles(optics)
+    _patch_catalogue_inputs(
+        monkeypatch, tmp_path, lambda month: _fake_records(month, wavelengths)
+    )
+    path = build.build_catalogue(
+        optics,
+        tmp_path / "output",
+        data_root=tmp_path,
+        start_year=2024,
+        end_year=2024,
+    )
+
+    catalogue = aerosol.load_dataset(path=path)
+    assert catalogue.wavelength_nm.values.tolist() == [250.0, 550.0, 40000.0]
+    for name, units in build._METADATA_UNITS.items():
+        assert catalogue[name].attrs["units"] == units
+    constituent = aerosol.constituent(
+        "tropical_extreme", month=7, path=path, optics_root=optics
+    )
+    assert isinstance(constituent, sk.constituent.ExtinctionScatterer)
 
 
 def test_build_catalogue_rejects_species_that_do_not_sum_to_total(

@@ -101,6 +101,34 @@ def test_species_map_matches_catalogue_builder():
     assert build._COMPONENTS == merra2_aerosol.MERRA2_AEROSOL_SPECIES
 
 
+def test_wavelength_rounding_matches_catalogue_builder():
+    build = _load_build_module()
+    assert build._WAVELENGTH_DECIMALS_NM == merra2_aerosol._WAVELENGTH_DECIMALS_NM
+
+
+def test_table_end_wavelength_matches_the_catalogue_grid(tmp_path, db_root):
+    # float32(4e-5) m is 39999.999 nm; unrounded, the catalogue's 40000 nm
+    # fell outside the table and constituent() refused the catalogue.
+    root = tmp_path / "optics"
+    root.mkdir()
+    table = _synthetic_table(root / "optics_SU.v1_3.nc")
+    with xr.open_dataset(table) as source:
+        wide = source.load().assign_coords(
+            {"lambda": np.array([2.5e-7, 5.5e-7, 4.0e-5], dtype=np.float32)}
+        )
+    table.unlink()
+    wide.to_netcdf(table)
+    assert np.float64(np.float32(4.0e-5)) * 1e9 != 40000.0
+
+    ds = merra2_aerosol.OpticalDatabaseMERRA2Aerosol(
+        "SO4", optics_root=root, db_root=db_root
+    ).load_ds()
+
+    np.testing.assert_array_equal(
+        ds["wavelength_nm"].to_numpy(), [250.0, 550.0, 40000.0]
+    )
+
+
 def test_exported_from_database_package():
     assert (
         sk.database.OpticalDatabaseMERRA2Aerosol
@@ -116,7 +144,10 @@ def test_generate_maps_table_to_scalar_database(optics_root, db_root):
     ds = db.load_ds()
     source = xr.open_dataset(optics_root / "optics_SU.v1_3.nc").isel(radius=0)
 
-    assert_allclose(ds["wavelength_nm"].to_numpy(), _LAMBDA_M * 1e9, rtol=1e-6)
+    # float32 metres rounded to the builder's 0.01 nm grid
+    np.testing.assert_array_equal(
+        ds["wavelength_nm"].to_numpy(), [300.0, 500.0, 1000.0]
+    )
     assert_allclose(ds["relative_humidity"].to_numpy(), _RH, rtol=1e-6)
     for name in ("xs_total", "xs_scattering", "lm_a1"):
         assert ds[name].dtype == np.float64
