@@ -39,10 +39,16 @@ bands are southern midlatitudes (`sh_midlat`, 55–35°S), the tropics (`tropica
 
 Month selection is exact and follows the CAIRT scenario months: 1, 4, 7, or 10.
 The loading levels use area-weighted monthly tropospheric AOD percentiles. Each
-case is an actual MERRA2 column selected from a narrow percentile window and
-chosen to represent the group's median vertical profile shape (extinction
-divided by column AOD), so the choice does not favour lower or higher loading
-within the window:
+case is an actual MERRA2 column selected from a narrow percentile window. Of
+the sampled columns in that window, the one chosen is closest to both the
+group's median vertical profile shape (extinction divided by column AOD) and
+its median composition (the share of 550 nm AOD from sulfate, dust, sea salt,
+black carbon, and organic carbon). Each case therefore has a typical aerosol
+mix for its band, month, and loading rather than whatever one column happened
+to contain, and the choice does not favour lower or higher loading within the
+window. The catalogue records the selected column's shares
+(`selection_type_aod_fraction`) and the window's median shares
+(`candidate_median_type_aod_fraction`):
 
 | Loading | AOD percentile window |
 | --- | --- |

@@ -580,6 +580,35 @@ def test_merra_extinction_uses_mass_density_humidity_and_wavelength(
     assert_allclose(extinction, np.full(2, expected))
 
 
+def test_aerosol_types_cover_every_component_once():
+    members = [name for species in build._AEROSOL_TYPES.values() for name in species]
+    assert sorted(members) == sorted(build._COMPONENTS)
+    assert set(build._AEROSOL_TYPE_NAMES) == set(build._AEROSOL_TYPES)
+
+
+def test_type_extinction_splits_the_total_by_aerosol_type(optics_root):
+    profiles, wavelengths = build.load_efficiency_profiles(optics_root)
+    ratios = {name: np.full(2, 1e-8) for name in build._COMPONENTS}
+    ratios["SO4"] = np.full(2, 3e-8)
+    aerosol_data = xr.Dataset(
+        {
+            "AIRDENS": ("lev", np.full(2, 1.2)),
+            "RH": ("lev", np.full(2, 0.5)),
+            **{name: ("lev", values) for name, values in ratios.items()},
+        }
+    )
+    by_type = build.calculate_type_extinction(aerosol_data, profiles, wavelengths)
+    total = build.calculate_extinction(aerosol_data, profiles, wavelengths)
+    assert by_type.shape == (len(build._AEROSOL_TYPES), 2)
+    assert_allclose(by_type.sum(axis=0), total, rtol=1e-12)
+    # Each row is the extinction of that type's species alone, in type order.
+    for row, species in zip(by_type, build._AEROSOL_TYPES.values(), strict=True):
+        alone = build.calculate_extinction(
+            aerosol_data, {name: profiles[name] for name in species}, wavelengths
+        )
+        assert_allclose(row, alone, rtol=1e-12)
+
+
 def test_merra_height_conversion_and_geoid_interpolation():
     latitude = np.array([0.0, 45.0])
     geopotential_height = np.array([10000.0, 10000.0])
@@ -1189,9 +1218,13 @@ def test_area_weighted_reservoir_keeps_representative_profiles():
     layer = np.broadcast_to(np.array([1000.0, 1000.0])[:, None, None], extinction.shape)
     tp_pressure = np.full((1, nlon), 60000.0)
     surface = np.zeros((1, nlon))
+    # 70% sulfate and 30% dust in every column.
+    type_extinction = np.zeros((len(build._AEROSOL_TYPES), *extinction.shape))
+    type_extinction[0] = 0.7 * extinction
+    type_extinction[1] = 0.3 * extinction
     reservoir = build._WeightedReservoir(1000, np.random.default_rng(7))
     reservoir.add(
-        extinction,
+        type_extinction,
         height,
         pressure,
         layer,
@@ -1205,6 +1238,7 @@ def test_area_weighted_reservoir_keeps_representative_profiles():
     )
     assert reservoir.aod.size == 1000
     assert reservoir.valid_candidates == 1000
+    assert_allclose(reservoir.composition, [[0.7, 0.3, 0.0, 0.0, 0.0]] * 1000)
     assert_allclose(
         np.trapezoid(reservoir.profiles, build._TARGET_ALTITUDES_M, axis=1),
         reservoir.aod,
@@ -1236,11 +1270,59 @@ def test_selection_is_not_biased_toward_low_loading_within_the_window():
         reservoir = build._WeightedReservoir(size, rng)
         reservoir.aod = aod
         reservoir.profiles = aod[:, None] * shape
+        reservoir.composition = rng.dirichlet(np.ones(len(build._AEROSOL_TYPES)), size)
         reservoir.valid_candidates = size
         for quantile, half_width in build._TIERS.values():
             _, percentile, *_ = reservoir.select_tier(quantile, half_width)
             positions.append((percentile / 100 - quantile) / half_width)
     assert abs(np.mean(positions)) < 0.15
+
+
+def test_selection_prefers_the_window_median_composition_and_shape():
+    # Composition and shape vary independently of loading. Shape-only selection
+    # left the chosen column's composition at a random rank in its window
+    # (median about the 50th percentile with this seed).
+    rng = np.random.default_rng(3)
+    altitudes = build._TARGET_ALTITUDES_M
+    composition_ranks, shape_ranks = [], []
+    for _ in range(30):
+        size = 5000
+        aod = rng.lognormal(np.log(0.1), 0.7, size)
+        scale_height = rng.uniform(800.0, 3000.0, size)[:, None]
+        shape = np.exp(-altitudes / scale_height) * rng.lognormal(
+            0.0, 0.4, (size, altitudes.size)
+        )
+        shape[:, altitudes > 12000.0] = 0.0
+        shape /= np.trapezoid(shape, altitudes, axis=1)[:, None]
+        reservoir = build._WeightedReservoir(size, rng)
+        reservoir.aod = aod
+        reservoir.profiles = aod[:, None] * shape
+        reservoir.composition = rng.dirichlet([2.0, 1.0, 1.5, 0.3, 0.8], size)
+        reservoir.valid_candidates = size
+        for quantile, half_width in build._TIERS.values():
+            index, *_ = reservoir.select_tier(quantile, half_width)
+            group = np.flatnonzero(
+                (reservoir.aod >= np.quantile(aod, max(0.0, quantile - half_width)))
+                & (reservoir.aod <= np.quantile(aod, min(1.0, quantile + half_width)))
+            )
+            target = reservoir.median_composition(quantile, half_width)
+            assert_allclose(target.sum(), 1.0)
+            composition_distance = np.sum(
+                (np.sqrt(reservoir.composition[group]) - np.sqrt(target)) ** 2, axis=1
+            )
+            shapes = shape[group]
+            transformed = np.log1p(shapes / np.median(shapes[shapes > 0]))
+            shape_distance = np.mean(
+                (transformed - np.median(transformed, axis=0)) ** 2, axis=1
+            )
+            chosen = np.flatnonzero(group == index)[0]
+            composition_ranks.append(
+                np.mean(composition_distance < composition_distance[chosen])
+            )
+            shape_ranks.append(np.mean(shape_distance < shape_distance[chosen]))
+    assert np.median(composition_ranks) < 0.05
+    assert np.max(composition_ranks) < 0.25
+    assert np.median(shape_ranks) < 0.15
 
 
 def test_month_checkpoint_restores_reservoir_and_skips_completed_days(
@@ -1299,6 +1381,7 @@ def test_month_checkpoint_restores_reservoir_and_skips_completed_days(
         reservoir.longitude_index = np.zeros(1000, dtype=np.int16)
         reservoir.tropopause_altitude = np.full(1000, 12000.0)
         reservoir.surface_altitude = np.zeros(1000)
+        reservoir.composition = np.tile([0.4, 0.3, 0.2, 0.05, 0.05], (1000, 1))
         reservoir.valid_candidates = 1000
 
     build._save_month_checkpoint(
@@ -1358,6 +1441,9 @@ def test_month_checkpoint_restores_reservoir_and_skips_completed_days(
     for band in build._BANDS:
         assert_allclose(resumed_reservoirs[band].aod, reservoirs[band].aod)
         assert_array_equal(resumed_reservoirs[band].time, reservoirs[band].time)
+        assert_allclose(
+            resumed_reservoirs[band].composition, reservoirs[band].composition
+        )
 
     def unexpected_source_read(*_args, **_kwargs):
         pytest.fail("A completed month checkpoint should not reread MERRA2 data")
@@ -1389,6 +1475,13 @@ def test_month_checkpoint_restores_reservoir_and_skips_completed_days(
         stage_daily=True,
     )
     assert len(records) == len(build._BANDS) * len(build._TIERS)
+    for record in records:
+        assert_allclose(
+            record["selection_type_aod_fraction"], [0.4, 0.3, 0.2, 0.05, 0.05]
+        )
+        assert_allclose(
+            record["candidate_median_type_aod_fraction"], [0.4, 0.3, 0.2, 0.05, 0.05]
+        )
     # Every selection is on 2024-01-01, so that day is read once for all of them.
     assert len(column_reads) == 1
     day, column_count, stage_daily, stager = column_reads[0]
@@ -1530,6 +1623,8 @@ def _fake_records(month, wavelengths_nm, species_scale=1.0):
             "surface_altitude_m": 0.0,
             "sampled_candidate_count": 1000,
             "valid_candidate_count": 10000,
+            "selection_type_aod_fraction": [0.5, 0.2, 0.2, 0.05, 0.05],
+            "candidate_median_type_aod_fraction": [0.45, 0.25, 0.2, 0.05, 0.05],
         }
         for band in build._BANDS
         for tier in build._TIERS
@@ -1626,6 +1721,17 @@ def test_builder_catalogue_loads_and_builds_the_default_constituent(
     assert catalogue.wavelength_nm.values.tolist() == [250.0, 550.0, 40000.0]
     for name, units in build._METADATA_UNITS.items():
         assert catalogue[name].attrs["units"] == units
+    assert catalogue.aerosol_type.values.tolist() == list(build._AEROSOL_TYPES)
+    assert_allclose(
+        catalogue.selection_type_aod_fraction.sel(scenario="tropical_extreme", month=7),
+        [0.5, 0.2, 0.2, 0.05, 0.05],
+    )
+    assert_allclose(
+        catalogue.candidate_median_type_aod_fraction.sel(
+            scenario="tropical_extreme", month=7
+        ),
+        [0.45, 0.25, 0.2, 0.05, 0.05],
+    )
     constituent = aerosol.constituent(
         "tropical_extreme", month=7, path=path, optics_root=optics
     )

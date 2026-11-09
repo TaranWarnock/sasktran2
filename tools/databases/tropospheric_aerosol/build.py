@@ -70,6 +70,23 @@ _COMPONENTS = {
     "OCPHILIC": ("optics_OC.v1_3.nc", 1),
     "OCPHOBIC": ("optics_OC.v1_3.nc", 0),
 }
+# Aerosol types describing a column's composition: the share of its 550 nm
+# tropospheric AOD from each type. Profile selection prefers columns whose
+# shares are close to their loading window's median.
+_AEROSOL_TYPES = {
+    "SU": ("SO4",),
+    "DU": tuple(f"DU{i:03d}" for i in range(1, 6)),
+    "SS": tuple(f"SS{i:03d}" for i in range(1, 6)),
+    "BC": ("BCPHILIC", "BCPHOBIC"),
+    "OC": ("OCPHILIC", "OCPHOBIC"),
+}
+_AEROSOL_TYPE_NAMES = {
+    "SU": "sulfate",
+    "DU": "dust",
+    "SS": "sea salt",
+    "BC": "black carbon",
+    "OC": "organic carbon",
+}
 _AEROSOL_VARIABLES = [
     "AIRDENS",
     "DELP",
@@ -88,7 +105,7 @@ _EGM2008_DATABASE_URL = (
     "https://arg.usask.ca/sasktranfiles/sasktran2_db/v_latest/"
     f"{_EGM2008_DATABASE_KEY}"
 )
-_CHECKPOINT_ALGORITHM_VERSION = 2
+_CHECKPOINT_ALGORITHM_VERSION = 3
 # GES DISC reprocessed these periods and publishes them only as stream 401.
 _STREAM_401_PERIODS = (
     (date(2020, 9, 1), date(2020, 9, 30)),
@@ -112,6 +129,7 @@ _RESERVOIR_ARRAY_FIELDS = (
     "longitude_index",
     "tropopause_altitude",
     "surface_altitude",
+    "composition",
 )
 
 
@@ -394,6 +412,39 @@ def calculate_extinction(
             efficiency = lower_efficiency * (1 - fraction) + upper_efficiency * fraction
         result += ratio * air_density * efficiency
     return result
+
+
+def calculate_type_extinction(
+    aerosol: xr.Dataset,
+    efficiency_profiles: dict[str, tuple[np.ndarray, np.ndarray]],
+    wavelengths_nm: np.ndarray,
+    wavelength_nm: float = 550.0,
+) -> np.ndarray:
+    """MERRA2 aerosol extinction at one wavelength in m-1, split by aerosol type.
+
+    The leading axis follows ``_AEROSOL_TYPES`` and sums to
+    :func:`calculate_extinction`. A type with no species in
+    ``efficiency_profiles`` is zero.
+    """
+    parts = []
+    for species in _AEROSOL_TYPES.values():
+        subset = {
+            name: efficiency_profiles[name]
+            for name in species
+            if name in efficiency_profiles
+        }
+        parts.append(
+            calculate_extinction(aerosol, subset, wavelengths_nm, wavelength_nm)
+            if subset
+            else None
+        )
+    present = [part for part in parts if part is not None]
+    if not present:
+        msg = "No MERRA2 aerosol species with efficiencies to calculate extinction"
+        raise ValueError(msg)
+    return np.stack(
+        [np.zeros_like(present[0]) if part is None else part for part in parts]
+    )
 
 
 def calculate_species_spectral_extinction(
@@ -1069,11 +1120,12 @@ class _WeightedReservoir:
         self.longitude_index = np.empty(0, dtype=np.int16)
         self.tropopause_altitude = np.empty(0)
         self.surface_altitude = np.empty(0)
+        self.composition = np.empty((0, len(_AEROSOL_TYPES)))
         self.valid_candidates = 0
 
     def add(
         self,
-        extinction: np.ndarray,
+        type_extinction: np.ndarray,
         height_m: np.ndarray,
         pressure_pa: np.ndarray,
         layer_thickness_m: np.ndarray,
@@ -1085,6 +1137,18 @@ class _WeightedReservoir:
         time_index: int,
         latitude_indices: np.ndarray,
     ) -> None:
+        """Offer one timestamp's columns to the reservoir.
+
+        ``type_extinction`` is 550 nm extinction split by aerosol type, with a
+        leading ``_AEROSOL_TYPES`` axis before (level, latitude, longitude).
+        """
+        if type_extinction.ndim != 4 or type_extinction.shape[0] != len(_AEROSOL_TYPES):
+            msg = (
+                "type_extinction must have a leading axis of "
+                f"{len(_AEROSOL_TYPES)} aerosol types before (level, lat, lon)"
+            )
+            raise ValueError(msg)
+        extinction = type_extinction.sum(axis=0)
         in_troposphere = pressure_pa >= tropopause_pressure_pa[None, :, :]
         valid_levels = (
             np.isfinite(extinction)
@@ -1107,6 +1171,14 @@ class _WeightedReservoir:
             axis=0,
         )
         valid_columns &= np.isfinite(column_aod) & (column_aod > 0)
+        type_aod = np.sum(
+            np.where(
+                (in_troposphere & valid_levels)[None],
+                type_extinction * layer_thickness_m[None],
+                0.0,
+            ),
+            axis=1,
+        ).reshape(len(_AEROSOL_TYPES), -1)
         flat = np.flatnonzero(valid_columns)
         if flat.size == 0:
             return
@@ -1184,6 +1256,9 @@ class _WeightedReservoir:
             "surface_altitude": surface_altitude_m[
                 accepted_lat_index, accepted_lon_index
             ],
+            "composition": (
+                type_aod[:, new_flat] / column_aod.ravel()[new_flat][None, :]
+            ).T,
         }
         old_fields = {
             "aod": self.aod,
@@ -1196,6 +1271,7 @@ class _WeightedReservoir:
             "longitude_index": self.longitude_index,
             "tropopause_altitude": self.tropopause_altitude,
             "surface_altitude": self.surface_altitude,
+            "composition": self.composition,
         }
         combined_keys = np.concatenate((self.keys, new_keys))
         combined_fields = {
@@ -1213,9 +1289,10 @@ class _WeightedReservoir:
             setattr(self, name, values[selected])
         self.valid_candidates += flat.size
 
-    def select_tier(
+    def _window(
         self, quantile: float, half_width: float
-    ) -> tuple[int, float, int, float, float]:
+    ) -> tuple[np.ndarray, float, float]:
+        """Indices of sampled columns in a percentile window, and its AOD bounds."""
         if self.aod.size < 1000:
             msg = (
                 "At least 1000 valid MERRA2 columns are required per "
@@ -1233,6 +1310,28 @@ class _WeightedReservoir:
                 f"{quantile - half_width:.3f}-{quantile + half_width:.3f}"
             )
             raise ValueError(msg)
+        return group, float(lower), float(upper)
+
+    def _median_composition(self, group: np.ndarray) -> np.ndarray:
+        median = np.median(self.composition[group], axis=0)
+        total = median.sum()
+        return median / total if total > 0 else median
+
+    def median_composition(self, quantile: float, half_width: float) -> np.ndarray:
+        """The window's median AOD share per aerosol type, renormalized to sum to 1."""
+        group, _, _ = self._window(quantile, half_width)
+        return self._median_composition(group)
+
+    def select_tier(
+        self, quantile: float, half_width: float
+    ) -> tuple[int, float, int, float, float]:
+        """Choose the window's most representative column.
+
+        Each candidate is scored by two distances from the window's medians,
+        each divided by its own median over the window so the two count
+        equally: vertical profile shape and aerosol-type composition.
+        """
+        group, lower, upper = self._window(quantile, half_width)
         # Compare profile shapes, each normalized by its own AOD. Scoring the
         # profiles themselves favoured the lowest-loading members: deviations
         # in log1p(extinction / scale) shrink with extinction, so 42 of 48
@@ -1251,7 +1350,18 @@ class _WeightedReservoir:
         scale = float(np.median(positive))
         transformed = np.log1p(group_shapes / scale)
         median_profile = np.median(transformed, axis=0)
-        score = np.mean((transformed - median_profile) ** 2, axis=1)
+        shape_score = np.mean((transformed - median_profile) ** 2, axis=1)
+        # Composition: squared differences of square-rooted AOD shares, so minor
+        # types such as black carbon still count against the major ones.
+        target = self._median_composition(group)
+        composition_score = np.sum(
+            (np.sqrt(np.clip(self.composition[group], 0.0, None)) - np.sqrt(target))
+            ** 2,
+            axis=1,
+        )
+        score = _relative_to_median(shape_score) + _relative_to_median(
+            composition_score
+        )
         selected_index = int(group[np.argmin(score)])
         percentile = float(100 * np.mean(self.aod <= self.aod[selected_index]))
         estimated_count = round(group.size / self.aod.size * self.valid_candidates)
@@ -1259,9 +1369,18 @@ class _WeightedReservoir:
             selected_index,
             percentile,
             max(estimated_count, 1),
-            float(lower),
-            float(upper),
+            lower,
+            upper,
         )
+
+
+def _relative_to_median(score: np.ndarray) -> np.ndarray:
+    """Scale scores by their median, so differently scaled scores can be added."""
+    median = float(np.median(score))
+    if median > 0:
+        return score / median
+    largest = float(np.max(score))
+    return score / largest if largest > 0 else np.zeros_like(score)
 
 
 def _file_for_product(
@@ -1596,6 +1715,8 @@ def _load_month_checkpoint(
                     sample_count > reservoir.capacity
                     or fields["profiles"].shape
                     != (sample_count, len(_TARGET_ALTITUDES_M))
+                    or fields["composition"].shape
+                    != (sample_count, len(_AEROSOL_TYPES))
                     or any(len(values) != sample_count for values in fields.values())
                 ):
                     msg = f"Invalid reservoir arrays in checkpoint: {path}"
@@ -1750,7 +1871,7 @@ def _process_month(
                         ):
                             msg = "MERRA2 source latitude/longitude grids do not match"
                             raise ValueError(msg)
-                        extinction = calculate_extinction(
+                        type_extinction = calculate_type_extinction(
                             aer_part, efficiency_profiles, wavelengths_nm
                         )
                         model_pressure = met_part.PL.values.astype(float)
@@ -1784,7 +1905,7 @@ def _process_month(
                                 / model_pressure
                             )
                         reservoirs[band].add(
-                            extinction,
+                            type_extinction,
                             model_height,
                             model_pressure,
                             layer_thickness,
@@ -1913,6 +2034,10 @@ def _process_month(
                 "surface_altitude_m": float(reservoir.surface_altitude[index]),
                 "sampled_candidate_count": int(reservoir.aod.size),
                 "valid_candidate_count": int(reservoir.valid_candidates),
+                "selection_type_aod_fraction": reservoir.composition[index].tolist(),
+                "candidate_median_type_aod_fraction": reservoir.median_composition(
+                    *_TIERS[loading]
+                ).tolist(),
             }
         )
     return result
@@ -2052,6 +2177,14 @@ def build_catalogue(
     relative_humidity = np.zeros(
         (len(scenarios), len(months), altitude_size), dtype=np.float32
     )
+    composition_names = (
+        "selection_type_aod_fraction",
+        "candidate_median_type_aod_fraction",
+    )
+    compositions = {
+        name: np.full((len(scenarios), len(months), len(_AEROSOL_TYPES)), np.nan)
+        for name in composition_names
+    }
     reference_index = _reference_wavelength_index(wavelengths_nm)
     metadata_names = [
         "selection_aod_550nm",
@@ -2091,6 +2224,12 @@ def build_catalogue(
         relative_humidity[scenario_index, month_index] = record["relative_humidity"]
         for name in metadata_names:
             metadata[name][scenario_index, month_index] = record[name]
+        for name in composition_names:
+            compositions[name][scenario_index, month_index] = record[name]
+    for name in composition_names:
+        if not np.isfinite(compositions[name]).all():
+            msg = f"Catalogue build did not select complete metadata for {name}"
+            raise ValueError(msg)
     for name in metadata_names:
         if not np.isfinite(
             np.asarray(metadata[name], dtype=float)
@@ -2145,6 +2284,29 @@ def build_catalogue(
                     ),
                 },
             ),
+            "selection_type_aod_fraction": (
+                ("scenario", "month", "aerosol_type"),
+                compositions["selection_type_aod_fraction"],
+                {
+                    "units": "1",
+                    "description": (
+                        "Share of the selected column's 550 nm tropospheric AOD "
+                        "from each aerosol type"
+                    ),
+                },
+            ),
+            "candidate_median_type_aod_fraction": (
+                ("scenario", "month", "aerosol_type"),
+                compositions["candidate_median_type_aod_fraction"],
+                {
+                    "units": "1",
+                    "description": (
+                        "Median share per aerosol type over the sampled columns "
+                        "in the loading window, renormalized to sum to 1; the "
+                        "composition the selection aims for"
+                    ),
+                },
+            ),
             "latitude_band": (("scenario", "month"), latitude_bands),
             "loading": (("scenario", "month"), loading_levels),
             **{
@@ -2162,6 +2324,14 @@ def build_catalogue(
             "scenario": scenarios,
             "month": months,
             "species": list(_COMPONENTS),
+            "aerosol_type": (
+                "aerosol_type",
+                list(_AEROSOL_TYPES),
+                {
+                    "long_names": json.dumps(_AEROSOL_TYPE_NAMES),
+                    "species": json.dumps(_AEROSOL_TYPES),
+                },
+            ),
             "altitude_m": (
                 "altitude_m",
                 _TARGET_ALTITUDES_M,
@@ -2189,7 +2359,15 @@ def build_catalogue(
             "reference_wavelength_nm": 550.0,
             "loading_percentile_method": "Area-weighted individual columns; weighted reservoir sample",
             "loading_windows": json.dumps(_TIERS, sort_keys=True),
-            "profile_selection": "Actual candidate nearest group median log1p(shape / median_positive_shape), shape = extinction / column AOD",
+            "profile_selection": (
+                "Actual candidate minimizing the sum of two distances from the "
+                "window's medians, each divided by its median over the window: "
+                "profile shape, mean squared difference in "
+                "log1p(shape / median_positive_shape) with shape = extinction / "
+                "column AOD; and composition, sum of squared differences in "
+                "sqrt(aerosol-type share of 550 nm AOD) from the renormalized "
+                "median shares"
+            ),
             "candidate_sampling_seed": seed,
             "candidate_reservoir_size": reservoir_size,
             "profile_altitude_grid": (
