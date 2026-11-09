@@ -1586,6 +1586,39 @@ def test_download_does_not_retry_a_missing_granule(tmp_path, monkeypatch):
     assert not list(tmp_path.iterdir())
 
 
+def test_staged_identity_comes_from_the_download_response(tmp_path, monkeypatch):
+    def get(url, **_kwargs):
+        response = _FakeDownload(200, body=url.encode())
+        response.headers |= {
+            "ETag": f'"{Path(url).name}"',
+            "Last-Modified": "Mon, 01 Apr 2024 00:00:00 GMT",
+        }
+        return response
+
+    def no_metadata_request(_location):
+        msg = "staging must not make a separate metadata request"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr(build.requests, "get", get)
+    monkeypatch.setattr(build, "_source_identity", no_metadata_request)
+    day = build.date(2024, 4, 10)
+
+    identities, staged = build._stage_day(day, tmp_path, checkpointing=True)
+
+    for product, location in build._source_locations(day, None).items():
+        assert staged[product].read_bytes() == location.encode()
+        # Same form as _source_identity's fsspec metadata, so resumed runs
+        # validate these checkpoints against a metadata request.
+        assert identities[product] == build._remote_source_identity(
+            location,
+            {
+                "size": len(location.encode()),
+                "ETag": f'"{Path(location).name}"',
+                "Last-Modified": "Mon, 01 Apr 2024 00:00:00 GMT",
+            },
+        )
+
+
 def test_staging_failure_is_logged_when_it_happens(tmp_path, monkeypatch, caplog):
     def fail(_location, _destination):
         msg = "disk full"

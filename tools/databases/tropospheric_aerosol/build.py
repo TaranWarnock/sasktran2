@@ -583,7 +583,13 @@ def _open_granule(location: Path | str, identity_callback=None):
 _RETRYABLE_DOWNLOAD_STATUS = frozenset({401, 403, 429, 500, 502, 503, 504})
 
 
-def _download_granule(location: str, destination: Path) -> None:
+def _download_granule(location: str, destination: Path) -> dict:
+    """Download ``location`` to ``destination``.
+
+    Returns the response's ``size``, ``ETag`` and ``Last-Modified`` in the
+    same form as fsspec's ``info()``, so ``_remote_source_identity`` gives the
+    same identity as a separate metadata request without the extra round trip.
+    """
     temporary_path = destination.with_name(f".{destination.name}.part")
     destination.parent.mkdir(parents=True, exist_ok=True)
     for attempt in range(5):
@@ -600,6 +606,11 @@ def _download_granule(location: str, destination: Path) -> None:
                 response.raise_for_status()
                 content_length = response.headers.get("Content-Length")
                 expected_size = int(content_length) if content_length else None
+                info = {
+                    "size": expected_size,
+                    "ETag": response.headers.get("ETag"),
+                    "Last-Modified": response.headers.get("Last-Modified"),
+                }
                 with temporary_path.open("wb") as stream:
                     last_progress = started
                     for chunk in response.iter_content(chunk_size=1024 * 1024):
@@ -637,7 +648,7 @@ def _download_granule(location: str, destination: Path) -> None:
                 received,
                 time.monotonic() - started,
             )
-            return
+            return info
         except requests.RequestException as exc:
             temporary_path.unlink(missing_ok=True)
             status = (
@@ -662,6 +673,8 @@ def _download_granule(location: str, destination: Path) -> None:
         except OSError:
             temporary_path.unlink(missing_ok=True)
             raise
+    msg = "unreachable: the last download attempt returns or raises"
+    raise AssertionError(msg)
 
 
 def _month_executor(workers: int) -> ProcessPoolExecutor:
@@ -702,10 +715,12 @@ def _stage_day(
     staged_locations = {}
     try:
         for product, location in _source_locations(day, None).items():
-            if checkpointing:
-                identities[product] = _source_identity(location)
             staged_path = directory / Path(location).name
-            _download_granule(location, staged_path)
+            info = _download_granule(location, staged_path)
+            if checkpointing:
+                # Taken from the download response itself: a separate metadata
+                # request costs 5-10 s per granule in the download thread.
+                identities[product] = _remote_source_identity(location, info)
             staged_locations[product] = staged_path
     except Exception:
         logging.exception("Failed to stage MERRA2 granules for %s", day.isoformat())
