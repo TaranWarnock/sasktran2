@@ -299,22 +299,59 @@ class _MERRA2MixedAerosol(
             )
             raise ValueError(msg)
 
-    def _warn_if_truncated(self, atmo) -> None:
+    def _warn_about_engine_settings(self, atmo) -> None:
+        """Warn about engine settings that misrepresent forward-peaked aerosol.
+
+        Coarse dust and sea salt need hundreds of phase-function moments near
+        backscatter. In testing, truncating them to 128 moments, using the
+        discrete-ordinates single-scatter source, or running multiple scatter
+        without delta-M scaling each gave radiance errors of tens of percent.
+        """
         available = atmo.leg_coeff.a1.shape[0]
         stored = self._database.sizes["legendre"]
         if available < stored:
             warnings.warn(
                 f"The engine keeps {available} of the aerosol's {stored} phase "
                 "function moments. Forward-peaked MERRA2 aerosols (dust, sea "
-                "salt) can then give a negative phase function and radiance; "
-                f"set config.num_singlescatter_moments to {stored}.",
+                "salt) can then give a much too small or negative phase function "
+                "and radiance; set config.num_singlescatter_moments to "
+                f"{stored}.",
+                UserWarning,
+                stacklevel=3,
+            )
+        config = getattr(atmo, "_config", None)
+        if config is None:
+            return
+        multiple_scatter = config.multiple_scatter_source
+        if (
+            multiple_scatter != sk.MultipleScatterSource.NoSource
+            and not config.delta_m_scaling
+        ):
+            warnings.warn(
+                "config.delta_m_scaling is off. Multiple scatter uses only "
+                "config.num_streams phase moments, which misrepresent "
+                "forward-peaked MERRA2 aerosols (dust, sea salt) without delta-M "
+                "scaling; set config.delta_m_scaling = True.",
+                UserWarning,
+                stacklevel=3,
+            )
+        if (
+            config.single_scatter_source == sk.SingleScatterSource.DiscreteOrdinates
+            and multiple_scatter == sk.MultipleScatterSource.DiscreteOrdinates
+        ):
+            warnings.warn(
+                "The discrete-ordinates single-scatter source uses only "
+                "config.num_streams phase moments, which can misestimate "
+                "radiance from forward-peaked MERRA2 aerosols (dust, sea salt) "
+                "by tens of percent; use sasktran2.SingleScatterSource.Exact with "
+                f"config.num_singlescatter_moments = {stored}.",
                 UserWarning,
                 stacklevel=3,
             )
 
     def atmosphere_quantities(self, atmo, **kwargs) -> OpticalQuantities:
         self._require_wavelengths(atmo)
-        self._warn_if_truncated(atmo)
+        self._warn_about_engine_settings(atmo)
         return super().atmosphere_quantities(atmo, **kwargs)
 
     def optical_derivatives(self, atmo, **kwargs) -> dict:
@@ -439,7 +476,7 @@ def constituent(
     path: str | Path | None = None,
     db_root: str | Path | None = None,
     optics_root: str | Path | None = None,
-    max_legendre_moments: int | None = 128,
+    max_legendre_moments: int | None = None,
 ) -> ExtinctionScatterer:
     """Create an extinction-normalized aerosol constituent.
 
@@ -450,12 +487,24 @@ def constituent(
     relative humidity, using the MERRA2 aerosol optics tables (see
     :class:`~sasktran2.database.OpticalDatabaseMERRA2Aerosol`). ``optics_root``
     selects a local directory holding those tables; otherwise they are
-    downloaded from the SASKTRAN2 standard database. ``max_legendre_moments``
-    truncates the phase function (``None`` keeps every table moment); 128
-    converges radiance for dust in testing. Set
-    ``config.num_singlescatter_moments`` to the same number: with the engine
-    default of 16, forward-peaked dust and sea salt give a negative phase
-    function and radiance, and a warning is raised.
+    downloaded from the SASKTRAN2 standard database.
+
+    Coarse dust and sea salt are strongly forward-peaked and need hundreds of
+    phase-function moments near backscatter, so ``max_legendre_moments``
+    defaults to ``None``, keeping every table moment (751 for the MERRA2
+    tables). Truncating sea salt to 128 moments gave radiance errors of tens
+    of percent, or negative radiance, in testing. For accurate radiance,
+    configure the engine with:
+
+    - ``config.num_singlescatter_moments`` equal to the number of moments kept
+      (751 by default);
+    - ``config.delta_m_scaling = True`` when a multiple-scatter source is used;
+    - the default ``sasktran2.SingleScatterSource.Exact``. The
+      discrete-ordinates single-scatter source uses only
+      ``config.num_streams`` moments.
+
+    With 16 streams these settings were within 0.5% of a 64-stream reference.
+    A warning is raised for each of these settings that is not met.
 
     Passing ``optical_property`` overrides the MERRA2 optics: its spectral
     shape, scattering and phase function are then used, normalized to the

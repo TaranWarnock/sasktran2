@@ -84,12 +84,28 @@ To add a case to an atmosphere, use the constituent. Its extinction follows
 the catalogue spectra (250 nm to 40 um), and its single-scattering albedo and
 phase function come from the case's MERRA2 species mixture and relative
 humidity, using the MERRA2 aerosol optics tables. It supports scalar
-calculations only (`num_stokes = 1`). Dust and sea salt are strongly
-forward-scattering, so keep enough phase-function moments in the single
-scatter calculation:
+calculations only (`num_stokes = 1`).
+
+Coarse dust and sea salt are strongly forward-scattering and need hundreds of
+phase-function moments near backscatter. The constituent keeps every table
+moment (751), and the engine must keep them too. Truncating sea salt to 128
+moments gave radiance errors of tens of percent, or negative radiance, in
+testing. Delta-M scaling fixes
+the multiple-scatter part but not the single scatter, and the
+discrete-ordinates single-scatter source sees only `num_streams` moments.
+These settings were within 0.5% of a 64-stream reference. Set them before
+creating the `sk.Atmosphere`, which sizes its phase-function storage from the
+config:
 
 ```python
-config.num_singlescatter_moments = 128
+config = sk.Config()
+config.num_singlescatter_moments = 751
+config.delta_m_scaling = True
+config.multiple_scatter_source = sk.MultipleScatterSource.DiscreteOrdinates
+config.num_streams = 16
+# Keep the default config.single_scatter_source = sk.SingleScatterSource.Exact
+
+atmosphere = sk.Atmosphere(model_geometry, config, wavelengths_nm=wavelengths_nm)
 atmosphere["tropospheric_aerosol"] = aerosol.constituent(
     "tropical_typical",
     month=7,

@@ -7,6 +7,7 @@ import logging
 import os
 import sys
 import threading
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -349,7 +350,7 @@ def test_default_constituent_runs_scalar_and_rejects_polarized(
         sk.Engine(config, geometry, viewing_geo).calculate_radiance(atmo)
 
 
-def test_mixed_optics_warn_when_the_engine_truncates_the_phase_function():
+def _mixed_optics_with_32_moments():
     altitude = np.array([0.0, 20000.0])
     wavelength = np.array([300.0, 900.0])
     moments = np.zeros((2, 2, 32))
@@ -370,8 +371,19 @@ def test_mixed_optics_warn_when_the_engine_truncates_the_phase_function():
         },
         coords={"altitude_m": altitude, "wavelength_nm": wavelength},
     )
-    optics = aerosol._MERRA2MixedAerosol(db=database)
-    config = sk.Config()  # 16 single-scatter moments by default
+    return aerosol._MERRA2MixedAerosol(db=database)
+
+
+def _recommended_config(moments):
+    config = sk.Config()
+    config.num_singlescatter_moments = moments
+    config.delta_m_scaling = True
+    config.multiple_scatter_source = sk.MultipleScatterSource.DiscreteOrdinates
+    config.num_streams = 4
+    return config
+
+
+def _mixed_optics_quantities(optics, config):
     geometry = sk.Geometry1D(
         0.6,
         0.0,
@@ -381,8 +393,85 @@ def test_mixed_optics_warn_when_the_engine_truncates_the_phase_function():
         sk.GeometryType.PlaneParallel,
     )
     atmo = sk.Atmosphere(geometry, config, wavelengths_nm=np.array([550.0]))
-    with pytest.warns(UserWarning, match="num_singlescatter_moments"):
-        optics.atmosphere_quantities(atmo, altitude_m=geometry.altitudes())
+    return optics.atmosphere_quantities(atmo, altitude_m=geometry.altitudes())
+
+
+def test_mixed_optics_do_not_warn_with_the_recommended_engine_settings():
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        _mixed_optics_quantities(
+            _mixed_optics_with_32_moments(), _recommended_config(32)
+        )
+
+
+def _truncated(config):
+    config.num_singlescatter_moments = 16
+
+
+def _without_delta_m(config):
+    config.delta_m_scaling = False
+
+
+def _discrete_ordinates_single_scatter(config):
+    config.single_scatter_source = sk.SingleScatterSource.DiscreteOrdinates
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        (_truncated, "keeps 16 of the aerosol's 32"),
+        (_without_delta_m, "delta_m_scaling is off"),
+        (_discrete_ordinates_single_scatter, "discrete-ordinates single-scatter"),
+    ],
+)
+def test_mixed_optics_warn_about_engine_settings_for_forward_peaked_aerosol(
+    change, message
+):
+    config = _recommended_config(32)
+    change(config)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        _mixed_optics_quantities(_mixed_optics_with_32_moments(), config)
+    messages = [str(item.message) for item in caught]
+    assert len(messages) == 1, messages
+    assert message in messages[0]
+
+
+def test_mixed_optics_without_multiple_scatter_need_no_delta_m():
+    config = sk.Config()  # no multiple-scatter source, delta-M off
+    config.num_singlescatter_moments = 32
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        _mixed_optics_quantities(_mixed_optics_with_32_moments(), config)
+
+
+def test_default_constituent_keeps_every_table_moment(
+    catalogue_path, wide_optics_root, monkeypatch
+):
+    # The synthetic tables store only three P11 moments, too few for a default
+    # cap to show, so check what the optics tables are asked for.
+    requested = []
+    database = aerosol.OpticalDatabaseMERRA2Aerosol
+
+    def recording_database(*args, **kwargs):
+        requested.append(kwargs["max_legendre_moments"])
+        return database(*args, **kwargs)
+
+    monkeypatch.setattr(aerosol, "OpticalDatabaseMERRA2Aerosol", recording_database)
+    default = aerosol.constituent(
+        "tropical_low", month=1, path=catalogue_path, optics_root=wide_optics_root
+    )
+    assert requested
+    assert set(requested) == {None}
+    truncated = aerosol.constituent(
+        "tropical_low",
+        month=1,
+        path=catalogue_path,
+        optics_root=wide_optics_root,
+        max_legendre_moments=2,
+    )
+    assert default._optical_property._database.sizes["legendre"] == 3
+    assert truncated._optical_property._database.sizes["legendre"] == 2
 
 
 def test_default_constituent_requires_optics_covering_the_catalogue(
