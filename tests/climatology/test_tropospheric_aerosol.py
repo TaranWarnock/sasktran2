@@ -951,7 +951,10 @@ def test_multi_year_month_skips_days_outside_the_month(tmp_path, monkeypatch):
     assert opened_days[31] == build.date(2024, 1, 1)
 
 
-def test_smoke_test_reads_and_processes_one_column(optics_root, monkeypatch):
+@pytest.mark.parametrize("access", ["local", "staged", "streamed"])
+def test_smoke_test_reads_and_processes_one_column(
+    optics_root, tmp_path, monkeypatch, access
+):
     timestamps = np.array(
         ["2024-01-01T00:00:00", "2024-01-01T03:00:00"],
         dtype="datetime64[s]",
@@ -1049,14 +1052,52 @@ def test_smoke_test_reads_and_processes_one_column(optics_root, monkeypatch):
         "tropopause": tropopause,
     }
 
-    @contextmanager
-    def open_test_dataset(location):
-        yield datasets[location]
+    opened, downloaded = [], []
 
-    monkeypatch.setattr(build, "_file_for_product", lambda product, *_: product)
+    @contextmanager
+    def open_test_dataset(location, *_args):
+        opened.append(str(location))
+        yield datasets[Path(str(location)).stem]
+
+    def download(location, destination):
+        downloaded.append(location)
+        destination.write_bytes(b"granule")
+        return {}
+
+    if access == "local":
+        data_root = tmp_path
+        for product in datasets:
+            (tmp_path / f"{product}.nc4").write_bytes(b"granule")
+        monkeypatch.setattr(
+            build, "_file_for_product", lambda product, *_: tmp_path / f"{product}.nc4"
+        )
+    else:
+        data_root = None
+        monkeypatch.setattr(
+            build,
+            "_file_for_product",
+            lambda product, *_: f"https://example.test/{product}.nc4",
+        )
     monkeypatch.setattr(build, "_open_granule", open_test_dataset)
+    monkeypatch.setattr(build, "_download_granule", download)
     result = build.run_smoke_test(
-        build.date(2024, 1, 1), optics_root, data_root=Path("unused")
+        build.date(2024, 1, 1),
+        optics_root,
+        data_root=data_root,
+        stage_daily=access != "streamed",
+    )
+    remote = [f"https://example.test/{product}.nc4" for product in datasets]
+    if access == "staged":
+        # Like the catalogue build, remote granules are downloaded whole first.
+        assert downloaded == remote
+        assert not any(location.startswith("https://") for location in opened)
+    elif access == "streamed":
+        assert not downloaded
+        assert opened == remote
+    else:
+        assert not downloaded
+    assert result["input_access"] == build._input_access_description(
+        data_root, access != "streamed"
     )
     assert result["status"] == "ok"
     assert len(result["timestamps_processed"]) == 2

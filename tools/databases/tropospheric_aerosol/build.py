@@ -946,14 +946,18 @@ def run_smoke_test(
     optics_root: Path,
     *,
     data_root: Path | None = None,
+    stage_daily: bool = True,
 ) -> dict:
-    """Read and process a sample column from each MERRA2 product for one day."""
+    """Read and process a sample column from each MERRA2 product for one day.
+
+    Remote granules are accessed as in the catalogue build: downloaded whole to
+    temporary storage by default, or streamed with range requests when
+    ``stage_daily`` is false.
+    """
     locations = _source_locations(day, data_root)
-    with (
-        _open_granule(locations["aerosol"]) as aerosol,
-        _open_granule(locations["meteorology"]) as meteorology,
-        _open_granule(locations["tropopause"]) as tropopause,
-    ):
+    with _open_daily_granules(
+        day, data_root, stage_daily=stage_daily, checkpointing=False
+    ) as (_, aerosol, meteorology, tropopause):
         _validate_inputs(aerosol, meteorology, tropopause)
         aerosol_times = aerosol.time.values
         tropopause_time_indices = np.searchsorted(tropopause.time.values, aerosol_times)
@@ -1023,6 +1027,7 @@ def run_smoke_test(
         "tropospheric_aod_550nm_min": float(aod.min()),
         "tropospheric_aod_550nm_max": float(aod.max()),
         "products": {name: str(location) for name, location in locations.items()},
+        "input_access": _input_access_description(data_root, stage_daily),
     }
 
 
@@ -2503,6 +2508,7 @@ def main() -> None:
             args.smoke_date,
             args.optics_root.expanduser(),
             data_root=data_root,
+            stage_daily=args.stage_daily,
         )
         args.output.mkdir(parents=True, exist_ok=True)
         report_path = args.output / f"merra2_smoke_{args.smoke_date:%Y%m%d}.json"

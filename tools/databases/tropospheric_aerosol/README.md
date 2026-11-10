@@ -58,6 +58,8 @@ bash tools/databases/tropospheric_aerosol/submit.sh \
 For a short one-day connectivity and processing check, submit the smoke job
 instead. It reads all aerosol timestamps and one sample column from each
 product, calculates 550 nm extinction and tropospheric AOD, and writes a JSON report.
+Like the catalogue build, it downloads that day's granules whole by default
+(`--no-stage-daily` streams them with range requests instead).
 The default test date is 2024-01-01:
 
 ```bash
