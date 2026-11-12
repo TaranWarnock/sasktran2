@@ -105,7 +105,7 @@ _EGM2008_DATABASE_URL = (
     "https://arg.usask.ca/sasktranfiles/sasktran2_db/v_latest/"
     f"{_EGM2008_DATABASE_KEY}"
 )
-_CHECKPOINT_ALGORITHM_VERSION = 3
+_CHECKPOINT_ALGORITHM_VERSION = 4
 # GES DISC reprocessed these periods and publishes them only as stream 401.
 _STREAM_401_PERIODS = (
     (date(2020, 9, 1), date(2020, 9, 30)),
@@ -992,15 +992,26 @@ def run_smoke_test(
     efficiencies, wavelengths_nm = load_efficiency_profiles(optics_root)
     extinction = calculate_extinction(aerosol_column, efficiencies, wavelengths_nm)
     pressure = meteorology_column.PL.values.astype(float)
+    # The geoid offset is common to every height in a column, so it does not
+    # change the tropospheric fractions and is omitted here.
+    height = _geopotential_to_geometric_height(
+        meteorology_column.H.values.astype(float), latitude
+    )
+    surface_height = _geopotential_to_geometric_height(
+        meteorology_column.PHIS.values.astype(float) / _STANDARD_GRAVITY, latitude
+    )
     temperature = meteorology_column.T.values.astype(float)
     delp = aerosol_column.DELP.values.astype(float)
     with np.errstate(divide="ignore", invalid="ignore"):
         layer_thickness = (
             _GAS_CONSTANT_DRY_AIR * temperature / _STANDARD_GRAVITY * delp / pressure
         )
-    troposphere_mask = pressure >= tropopause_pressures[:, None]
+    fraction, _ = _tropospheric_fraction(
+        height.T, pressure.T, tropopause_pressures, surface_height
+    )
+    fraction = fraction.T
     valid = (
-        troposphere_mask
+        (fraction > 0)
         & np.isfinite(extinction)
         & np.isfinite(layer_thickness)
         & (layer_thickness > 0)
@@ -1008,7 +1019,7 @@ def run_smoke_test(
     if not valid.any(axis=1).all():
         msg = f"No valid tropospheric model layers in smoke-test samples for {day}"
         raise ValueError(msg)
-    aod = np.sum(np.where(valid, extinction * layer_thickness, 0.0), axis=1)
+    aod = np.sum(np.where(valid, extinction * layer_thickness * fraction, 0.0), axis=1)
     if not np.isfinite(aod).all() or np.any(aod <= 0):
         msg = f"Computed smoke-test AOD is not finite and positive: {aod.tolist()}"
         raise ValueError(msg)
@@ -1046,6 +1057,72 @@ def _height_at_pressure(
     return float(np.interp(tropopause_pressure_pa, pressure, height))
 
 
+def _tropospheric_fraction(
+    height_m: np.ndarray,
+    pressure_pa: np.ndarray,
+    tropopause_pressure_pa: np.ndarray | float,
+    surface_altitude_m: np.ndarray | float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Fraction of each model layer below the tropopause, and its height.
+
+    Arrays have model levels on axis 0, in any order, and any trailing column
+    axes. Layers span the midpoints between neighbouring model heights; the
+    lowest starts at the surface when that is below its centre and the highest
+    extends half a level spacing up, as in _conservative_grid_profile. The
+    tropopause height is TROPPB interpolated linearly in pressure between model
+    levels, as in _height_at_pressure.
+
+    MERRA2's TROPPB usually equals a model level's pressure, so the tropopause
+    falls near the middle of a layer. Counting that whole layer in or out by
+    its mid-layer pressure put half a layer of AOD above the tropopause (a
+    spike at the top grid point) or left a half-layer gap below it; only the
+    part of the layer below the tropopause counts here. Columns with
+    non-finite or non-monotonic heights or pressures get NaN.
+    """
+    height_m = np.asarray(height_m, dtype=float)
+    pressure_pa = np.asarray(pressure_pa, dtype=float)
+    tropopause = np.asarray(tropopause_pressure_pa, dtype=float)
+    surface = np.asarray(surface_altitude_m, dtype=float)
+    order = np.argsort(height_m, axis=0)
+    height = np.take_along_axis(height_m, order, axis=0)
+    pressure = np.take_along_axis(pressure_pa, order, axis=0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        valid = (
+            np.all(np.isfinite(height) & np.isfinite(pressure), axis=0)
+            & np.all(np.diff(height, axis=0) > 0, axis=0)
+            & np.all(np.diff(pressure, axis=0) < 0, axis=0)
+            & np.isfinite(tropopause)
+            & np.isfinite(surface)
+        )
+        # Pressure falls with height, so levels at or below the tropopause
+        # pressure come first; interpolate across the first one above it.
+        upper = np.clip(np.sum(pressure >= tropopause, axis=0), 1, len(height) - 1)
+        lower = upper - 1
+        h0 = np.take_along_axis(height, lower[None], axis=0)[0]
+        h1 = np.take_along_axis(height, upper[None], axis=0)[0]
+        p0 = np.take_along_axis(pressure, lower[None], axis=0)[0]
+        p1 = np.take_along_axis(pressure, upper[None], axis=0)[0]
+        tropopause_height = h0 + np.clip((tropopause - p0) / (p1 - p0), 0, 1) * (
+            h1 - h0
+        )
+        edges = np.concatenate(
+            (
+                np.minimum(surface, height[0])[None],
+                0.5 * (height[1:] + height[:-1]),
+                (height[-1] + 0.5 * (height[-1] - height[-2]))[None],
+            )
+        )
+        sorted_fraction = np.clip(
+            (tropopause_height - edges[:-1]) / (edges[1:] - edges[:-1]), 0.0, 1.0
+        )
+    fraction = np.empty_like(sorted_fraction)
+    np.put_along_axis(fraction, order, sorted_fraction, axis=0)
+    return (
+        np.where(valid, fraction, np.nan),
+        np.where(valid, tropopause_height, np.nan),
+    )
+
+
 def _input_access_description(data_root: Path | None, stage_daily: bool) -> str:
     if data_root is not None:
         return "local MERRA2 granules"
@@ -1061,24 +1138,30 @@ def _conservative_grid_profile(
     extinction: np.ndarray,
     height_m: np.ndarray,
     layer_thickness_m: np.ndarray,
-    tropospheric: np.ndarray,
+    tropospheric_fraction: np.ndarray,
     surface_altitude_m: float,
     tropopause_altitude_m: float,
 ) -> np.ndarray:
     """Map layer extinction (levels, ...) to _TARGET_ALTITUDES_M conserving AOD.
 
-    Each tropospheric layer's AOD (extinction * hydrostatic thickness) is spread
-    uniformly between the midpoints of its neighbours' heights, starting at the
-    surface. The cumulative AOD is binned into cells around each grid point;
-    cells below the surface or above the tropopause fold into the nearest valid
-    point (the runtime zeroes those points). Dividing by the trapezoid weights
-    makes the trapezoid integral on the grid equal the native tropospheric AOD.
+    Each layer's AOD (extinction * hydrostatic thickness) is spread uniformly
+    between the midpoints of its neighbours' heights, starting at the surface,
+    and the cumulative AOD is cut at the tropopause height. With
+    ``tropospheric_fraction`` and ``tropopause_altitude_m`` from
+    _tropospheric_fraction, the layer containing the tropopause contributes
+    only its part below it. The cumulative AOD is binned into cells around
+    each grid point; cells below the surface or above the last grid point
+    below the tropopause fold into the nearest valid point (the runtime zeroes
+    those points). Dividing by the trapezoid weights makes the trapezoid
+    integral on the grid equal sum(extinction * thickness * fraction).
     """
     order = np.argsort(height_m)
     height = height_m[order]
     columns = extinction.reshape(len(height_m), -1)[order]
     layer_aod = np.where(
-        tropospheric[order, None], columns * layer_thickness_m[order, None], 0.0
+        tropospheric_fraction[order, None] > 0,
+        columns * layer_thickness_m[order, None],
+        0.0,
     )
     edges = np.concatenate(
         (
@@ -1091,8 +1174,9 @@ def _conservative_grid_profile(
     grid = _TARGET_ALTITUDES_M
     spacing = grid[1] - grid[0]
     bounds = np.concatenate(([-np.inf], grid[:-1] + 0.5 * spacing, [np.inf]))
+    cut = np.minimum(bounds, tropopause_altitude_m)
     cell_aod = np.diff(
-        np.column_stack([np.interp(bounds, edges, column) for column in cumulative.T]),
+        np.column_stack([np.interp(cut, edges, column) for column in cumulative.T]),
         axis=0,
     )
     valid = _valid_grid_points(surface_altitude_m, tropopause_altitude_m)
@@ -1154,7 +1238,10 @@ class _WeightedReservoir:
             )
             raise ValueError(msg)
         extinction = type_extinction.sum(axis=0)
-        in_troposphere = pressure_pa >= tropopause_pressure_pa[None, :, :]
+        tropospheric_fraction, tropopause_altitude = _tropospheric_fraction(
+            height_m, pressure_pa, tropopause_pressure_pa, surface_altitude_m
+        )
+        in_troposphere = tropospheric_fraction > 0
         valid_levels = (
             np.isfinite(extinction)
             & np.isfinite(height_m)
@@ -1165,12 +1252,13 @@ class _WeightedReservoir:
             np.isfinite(tropopause_pressure_pa)
             & (tropopause_pressure_pa > 0)
             & np.isfinite(surface_altitude_m)
+            & np.isfinite(tropopause_altitude)
             & np.all(~in_troposphere | valid_levels, axis=0)
         )
         column_aod = np.sum(
             np.where(
                 in_troposphere & valid_levels,
-                extinction * layer_thickness_m,
+                extinction * layer_thickness_m * tropospheric_fraction,
                 0.0,
             ),
             axis=0,
@@ -1179,7 +1267,7 @@ class _WeightedReservoir:
         type_aod = np.sum(
             np.where(
                 (in_troposphere & valid_levels)[None],
-                type_extinction * layer_thickness_m[None],
+                type_extinction * (layer_thickness_m * tropospheric_fraction)[None],
                 0.0,
             ),
             axis=1,
@@ -1210,29 +1298,14 @@ class _WeightedReservoir:
         new_profiles = np.empty((len(accepted), len(_TARGET_ALTITUDES_M)))
         new_tropopause_altitude = np.empty(len(accepted))
         for index, flat_index in enumerate(new_flat):
+            # valid_columns guarantees finite, monotonic heights and pressures.
             ilat, ilon = divmod(int(flat_index), nlon)
-            column_pressure = pressure_pa[:, ilat, ilon]
-            column_height = height_m[:, ilat, ilon]
-            column_extinction = extinction[:, ilat, ilon]
-            tropospheric = column_pressure >= tropopause_pressure_pa[ilat, ilon]
-            order = np.argsort(column_height)
-            sorted_height = column_height[order]
-            if not np.isfinite(sorted_height).all() or np.any(
-                np.diff(sorted_height) <= 0
-            ):
-                new_profiles[index] = np.nan
-                new_tropopause_altitude[index] = np.nan
-                continue
-            new_tropopause_altitude[index] = _height_at_pressure(
-                column_pressure,
-                column_height,
-                tropopause_pressure_pa[ilat, ilon],
-            )
+            new_tropopause_altitude[index] = tropopause_altitude[ilat, ilon]
             new_profiles[index] = _conservative_grid_profile(
-                column_extinction,
-                column_height,
+                extinction[:, ilat, ilon],
+                height_m[:, ilat, ilon],
                 layer_thickness_m[:, ilat, ilon],
-                tropospheric,
+                tropospheric_fraction[:, ilat, ilon],
                 surface_altitude_m[ilat, ilon],
                 new_tropopause_altitude[index],
             )
@@ -1547,15 +1620,20 @@ def _column_spectrum(
         * aerosol_column.DELP.values.astype(float)
         / pressure
     )
-    tropospheric = pressure >= tropopause_pressure
-    tropopause_height = _height_at_pressure(pressure, height, tropopause_pressure)
+    tropospheric_fraction, tropopause_height = _tropospheric_fraction(
+        height, pressure, tropopause_pressure, surface_height
+    )
+    tropopause_height = float(tropopause_height)
+    if not np.isfinite(tropopause_height):
+        msg = "MERRA2 column pressure and height must be finite and monotonic"
+        raise ValueError(msg)
 
     def on_grid(values: np.ndarray) -> np.ndarray:
         return _conservative_grid_profile(
             values,
             height,
             layer_thickness,
-            tropospheric,
+            tropospheric_fraction,
             surface_height,
             tropopause_height,
         )
@@ -2376,9 +2454,11 @@ def build_catalogue(
             "candidate_sampling_seed": seed,
             "candidate_reservoir_size": reservoir_size,
             "profile_altitude_grid": (
-                "0-20 km every 250 m; zero below ground and above TROPPB; "
-                "values chosen so the trapezoid integral on this grid equals "
-                "the native-layer tropospheric AOD"
+                "0-20 km every 250 m; zero below ground and above the "
+                "tropopause (TROPPB interpolated to height); values chosen so "
+                "the trapezoid integral on this grid equals the native-layer "
+                "tropospheric AOD, counting only the part of the layer "
+                "containing the tropopause that lies below it"
             ),
             "optical_table_files": json.dumps(_OPTICS_FILES),
             "remote_access": _input_access_description(data_root, stage_daily),

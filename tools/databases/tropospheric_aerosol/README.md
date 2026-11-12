@@ -160,7 +160,11 @@ The five required optical files are:
 The builder maps aerosol species to optical bins using the MERRA2 optical
 property tables, then applies the mass-mixing-ratio conversion, relative-
 humidity interpolation, and `bext` calculations. Extinction is integrated
-over hydrostatic model-layer thickness where `PL >= TROPPB`. Individual
+over hydrostatic model-layer thickness up to the tropopause height (`TROPPB`
+interpolated in pressure between model levels). The layer containing the
+tropopause counts only below it: `TROPPB` usually equals a model level's
+pressure, so counting that whole layer in or out would put half a layer of AOD
+above the tropopause or leave a gap below it. Individual
 columns are area-weighted by cosine latitude. A deterministic weighted
 reservoir bounds memory while estimating monthly percentile windows; the seed,
 reservoir size, candidate counts, and selected source columns are recorded in

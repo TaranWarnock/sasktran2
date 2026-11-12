@@ -1102,7 +1102,8 @@ def test_smoke_test_reads_and_processes_one_column(
     assert result["status"] == "ok"
     assert len(result["timestamps_processed"]) == 2
     assert result["model_levels_per_column"] == 3
-    assert result["tropospheric_levels_per_timestamp"] == [1, 1]
+    # The 50 kPa level's layer is partly below the 60 kPa tropopause.
+    assert result["tropospheric_levels_per_timestamp"] == [2, 2]
     assert len(result["tropospheric_aod_550nm_per_timestamp"]) == 2
     assert result["tropospheric_aod_550nm_min"] > 0
 
@@ -1215,23 +1216,92 @@ def test_conservative_grid_profile_preserves_tropospheric_aod(surface):
     thickness = np.array(
         [120.0, 260.0, 640.0, 960.0, 2040.0, 3960.0, 3040.0, 960.0, 4000.0]
     )[::-1]
-    tropospheric = heights < surface + 11800.0
-    tropopause_altitude = surface + 11800.0
+    # Linear in pressure between levels, so the tropopause is inside a layer.
+    pressures = 101325.0 * np.exp(-(heights - surface) / 8000.0)
+    fraction, tropopause_altitude = build._tropospheric_fraction(
+        heights, pressures, 101325.0 * np.exp(-11800.0 / 8000.0), surface
+    )
+    assert 0 < np.min(fraction[fraction > 0]) < 1
     rng = np.random.default_rng(3)
     extinction = rng.uniform(1e-6, 1e-4, size=(len(heights), 2))
 
     profile = build._conservative_grid_profile(
-        extinction, heights, thickness, tropospheric, surface, tropopause_altitude
+        extinction, heights, thickness, fraction, surface, float(tropopause_altitude)
     )
 
     grid = build._TARGET_ALTITUDES_M
     assert profile.shape == (len(grid), 2)
     assert (profile >= 0).all()
     assert not profile[(grid < surface) | (grid > tropopause_altitude)].any()
-    expected = np.sum(
-        np.where(tropospheric[:, None], extinction * thickness[:, None], 0.0), axis=0
-    )
+    expected = np.sum(extinction * (thickness * fraction)[:, None], axis=0)
     assert_allclose(np.trapezoid(profile, grid, axis=0), expected, rtol=1e-12)
+
+
+def test_tropospheric_fraction_matches_column_helpers():
+    rng = np.random.default_rng(5)
+    nlev, ncol = 12, 40
+    height = np.sort(rng.uniform(0.0, 20000.0, (nlev, ncol)), axis=0)[::-1]
+    pressure = 101325.0 * np.exp(-height / 7500.0)
+    tropopause = 101325.0 * np.exp(-rng.uniform(-500.0, 21000.0, ncol) / 7500.0)
+    surface = rng.uniform(-50.0, 300.0, ncol)
+    fraction, tropopause_height = build._tropospheric_fraction(
+        height, pressure, tropopause, surface
+    )
+    for column in range(ncol):
+        assert tropopause_height[column] == pytest.approx(
+            build._height_at_pressure(
+                pressure[:, column], height[:, column], tropopause[column]
+            )
+        )
+        # Same result for one column at a time and for any level order.
+        flipped = build._tropospheric_fraction(
+            height[::-1, column],
+            pressure[::-1, column],
+            tropopause[column],
+            surface[column],
+        )
+        assert_allclose(flipped[0][::-1], fraction[:, column])
+        below = height[:, column] < tropopause_height[column]
+        # Whole layers below, nothing above, and at most two partial layers
+        # around the tropopause.
+        assert np.all(fraction[~below, column] < 1)
+        assert np.sum((fraction[:, column] > 0) & (fraction[:, column] < 1)) <= 1
+    height[3, 0] = np.nan
+    height[4, 1] = height[5, 1]
+    fraction, tropopause_height = build._tropospheric_fraction(
+        height, pressure, tropopause, surface
+    )
+    assert np.isnan(fraction[:, :2]).all()
+    assert np.isnan(tropopause_height[:2]).all()
+    assert np.isfinite(fraction[:, 2:]).all()
+
+
+@pytest.mark.parametrize("nudge", [-1e-9, 0.0, 1e-9])
+def test_tropopause_on_a_model_level_gives_no_spike_or_gap(nudge):
+    # MERRA2's TROPPB usually equals a model level's pressure. Uniform
+    # extinction must map to a uniform profile up to the tropopause whether
+    # rounding puts that level just inside or just outside the troposphere.
+    heights = np.arange(500.0, 20000.0, 1000.0)
+    pressures = 101325.0 * np.exp(-heights / 7500.0)
+    thickness = np.full(heights.size, 1000.0)
+    extinction = np.full((heights.size, 1), 2e-6)
+    tropopause_pressure = pressures[12] * (1 + nudge)  # level at 12.5 km
+    fraction, tropopause_altitude = build._tropospheric_fraction(
+        heights, pressures, tropopause_pressure, 0.0
+    )
+    assert float(tropopause_altitude) == pytest.approx(12500.0, abs=1e-3)
+    assert fraction[12] == pytest.approx(0.5, abs=1e-6)
+    profile = build._conservative_grid_profile(
+        extinction, heights, thickness, fraction, 0.0, float(tropopause_altitude)
+    )[:, 0]
+    grid = build._TARGET_ALTITUDES_M
+    inside = grid <= float(tropopause_altitude)
+    assert_allclose(profile[inside][:-1], 2e-6, rtol=1e-6)
+    # The top point's cell is cut at the tropopause (here at the point
+    # itself), so it carries 0.5-1.5 times the local extinction.
+    assert 0.5 * 2e-6 * (1 - 1e-6) <= profile[inside][-1] <= 1.5 * 2e-6
+    assert not profile[~inside].any()
+    assert np.trapezoid(profile, grid) == pytest.approx(12500.0 * 2e-6, rel=1e-6)
 
 
 def test_remote_granule_retries_transient_failures_and_refreshes_expired_url(
