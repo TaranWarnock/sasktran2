@@ -292,6 +292,227 @@ def test_region_flags_distinguish_below_surface_and_above_tropopause(
     )
 
 
+def test_smoothing_keeps_aod_and_stays_in_the_troposphere(
+    offgrid_catalogue, offgrid_catalogue_path
+):
+    source = offgrid_catalogue.sel(scenario="tropical_typical", month=4)
+    altitudes = source.altitude_m.values
+    for wavelength in source.wavelength_nm.values:
+        raw = aerosol.profile(
+            "tropical_typical",
+            month=4,
+            wavelength_nm=wavelength,
+            path=offgrid_catalogue_path,
+        )
+        smooth = aerosol.profile(
+            "tropical_typical",
+            month=4,
+            wavelength_nm=wavelength,
+            smoothing_fwhm_m=3000.0,
+            path=offgrid_catalogue_path,
+        )
+        extinction = smooth.extinction_per_m.values
+        assert_allclose(
+            np.trapezoid(extinction, altitudes),
+            np.trapezoid(raw.extinction_per_m.values, altitudes),
+            rtol=1e-12,
+        )
+        assert (extinction >= 0).all()
+        assert not extinction[(altitudes < 1300.0) | (altitudes > 11700.0)].any()
+        assert not np.allclose(extinction, raw.extinction_per_m.values)
+        assert smooth.attrs["smoothing_fwhm_m"] == 3000.0
+    # Smoothing evens out the profile: the exponential decay flattens.
+    inside = (altitudes > 1300.0) & (altitudes < 11700.0)
+    assert np.ptp(extinction[inside]) < np.ptp(raw.extinction_per_m.values[inside])
+
+
+def test_smoothing_keeps_species_summing_to_the_total(offgrid_catalogue):
+    case = offgrid_catalogue.sel(scenario="tropical_typical", month=4)
+    smooth = aerosol._smooth(case, 3000.0)
+    assert_allclose(
+        smooth.species_extinction_550nm_per_m.sum("species"),
+        smooth.extinction_per_m.sel(wavelength_nm=550.0),
+        rtol=1e-12,
+        atol=1e-25,
+    )
+    assert smooth.species_extinction_550nm_per_m.dims == (
+        case.species_extinction_550nm_per_m.dims
+    )
+    assert smooth.extinction_per_m.attrs["units"] == "m-1"
+
+
+@pytest.mark.parametrize("fwhm", [250.0, 1000.0, 5000.0, 50000.0])
+def test_smoothing_leaves_a_constant_profile_unchanged_at_the_boundaries(fwhm):
+    altitudes = np.arange(0.0, 20001.0, 250.0)
+    valid = (altitudes >= 1250.0) & (altitudes <= 11750.0)
+    matrix = aerosol._smoothing_matrix(altitudes, valid, fwhm)
+    constant = np.where(valid, 3.0, 0.0)
+    assert_allclose(matrix @ constant, constant, rtol=1e-12, atol=1e-15)
+    assert_allclose(matrix.sum(axis=0)[valid], 1.0, rtol=1e-12)
+    assert not matrix[~valid].any()
+    assert not matrix[:, ~valid].any()
+
+
+def test_zero_smoothing_returns_the_catalogue(offgrid_catalogue_path):
+    raw = aerosol.profile("tropical_typical", month=4, path=offgrid_catalogue_path)
+    same = aerosol.profile(
+        "tropical_typical", month=4, smoothing_fwhm_m=0, path=offgrid_catalogue_path
+    )
+    assert_array_equal(same.extinction_per_m.values, raw.extinction_per_m.values)
+
+
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        ({"smoothing_fwhm_m": -1.0}, "smoothing_fwhm_m"),
+        ({"smoothing_fwhm_m": np.nan}, "smoothing_fwhm_m"),
+        ({"ground_altitude_m": np.inf}, "ground_altitude_m"),
+    ],
+)
+def test_invalid_smoothing_or_ground(offgrid_catalogue_path, options, message):
+    with pytest.raises(ValueError, match=message):
+        aerosol.profile(
+            "tropical_typical", month=4, path=offgrid_catalogue_path, **options
+        )
+
+
+def test_ground_altitude_moves_the_profile_to_the_model_ground(
+    offgrid_catalogue, offgrid_catalogue_path
+):
+    raw = aerosol.profile("tropical_typical", month=4, path=offgrid_catalogue_path)
+    moved = aerosol.profile(
+        "tropical_typical",
+        month=4,
+        ground_altitude_m=0.0,
+        path=offgrid_catalogue_path,
+    )
+    # The catalogue surface is at 1300 m; everything moves down by that much.
+    assert_allclose(moved.altitude_m, raw.altitude_m - 1300.0)
+    assert_array_equal(moved.extinction_per_m.values, raw.extinction_per_m.values)
+    assert float(moved.surface_altitude_m) == 0.0
+    assert float(moved.tropopause_altitude_m) == 10400.0
+    assert moved.attrs["vertical_shift_m"] == -1300.0
+    assert moved.attrs["ground_altitude_m"] == 0.0
+    assert raw.attrs["ground_altitude_m"] == "catalogue"
+
+    altitudes = np.arange(0.0, 20001.0, 1000.0)
+    on_grid = aerosol.profile(
+        "tropical_typical",
+        month=4,
+        altitudes_m=altitudes,
+        ground_altitude_m=0.0,
+        path=offgrid_catalogue_path,
+    )
+    assert float(on_grid.extinction_per_m.sel(altitude_m=0.0)) > 0
+    assert_allclose(
+        float(on_grid.tropospheric_aod), _catalogue_aod(offgrid_catalogue), rtol=1e-12
+    )
+
+
+def _atmosphere(altitudes_m, wavelengths_nm=(400.0, 600.0)):
+    config = sk.Config()
+    config.num_streams = 4
+    geometry = sk.Geometry1D(
+        0.6,
+        0.0,
+        6372000.0,
+        altitudes_m,
+        sk.InterpolationMethod.LinearInterpolation,
+        sk.GeometryType.PlaneParallel,
+    )
+    viewing_geo = sk.ViewingGeometry()
+    viewing_geo.add_ray(sk.GroundViewingSolar(0.6, 0.0, 0.8, 200000.0))
+    atmo = sk.Atmosphere(geometry, config, wavelengths_nm=np.array(wavelengths_nm))
+    sk.climatology.us76.add_us76_standard_atmosphere(atmo)
+    atmo["rayleigh"] = sk.constituent.Rayleigh()
+    return config, geometry, viewing_geo, atmo
+
+
+def _radiance(constituent, altitudes_m):
+    config, geometry, viewing_geo, atmo = _atmosphere(altitudes_m)
+    atmo["tropospheric_aerosol"] = constituent
+    engine = sk.Engine(config, geometry, viewing_geo)
+    return engine.calculate_radiance(atmo)["radiance"].to_numpy()
+
+
+def test_constituent_follows_the_atmosphere_grid_and_keeps_the_aod(
+    offgrid_catalogue, offgrid_catalogue_path, wide_optics_root
+):
+    constituent = aerosol.constituent(
+        "tropical_typical",
+        month=4,
+        path=offgrid_catalogue_path,
+        optics_root=wide_optics_root,
+    )
+    assert isinstance(constituent, aerosol.TroposphericAerosolConstituent)
+    assert_array_equal(constituent.altitudes_m, offgrid_catalogue.altitude_m.values)
+    for spacing in (1000.0, 2500.0):
+        altitudes = np.arange(0.0, 30001.0, spacing)
+        assert np.isfinite(_radiance(constituent, altitudes)).all()
+        assert_array_equal(constituent.altitudes_m, altitudes)
+        assert_allclose(
+            np.trapezoid(constituent.extinction_per_m, altitudes),
+            _catalogue_aod(offgrid_catalogue),
+            rtol=1e-12,
+        )
+
+
+def test_following_the_grid_matches_an_explicit_grid(
+    offgrid_catalogue_path, wide_optics_root
+):
+    altitudes = np.arange(0.0, 30001.0, 1000.0)
+    options = {
+        "month": 4,
+        "path": offgrid_catalogue_path,
+        "optics_root": wide_optics_root,
+        "smoothing_fwhm_m": 1000.0,
+        "ground_altitude_m": 0.0,
+    }
+    following = _radiance(aerosol.constituent("tropical_typical", **options), altitudes)
+    explicit = _radiance(
+        aerosol.constituent("tropical_typical", altitudes_m=altitudes, **options),
+        altitudes,
+    )
+    assert np.isfinite(following).all()
+    assert_allclose(following, explicit, rtol=1e-12)
+    config, geometry, viewing_geo, atmo = _atmosphere(altitudes)
+    rayleigh_only = (
+        sk.Engine(config, geometry, viewing_geo)
+        .calculate_radiance(atmo)["radiance"]
+        .to_numpy()
+    )
+    assert not np.allclose(following, rayleigh_only)
+
+
+def test_explicit_grid_is_kept_when_added_to_another_atmosphere(
+    offgrid_catalogue_path, wide_optics_root
+):
+    altitudes = np.arange(0.0, 20001.0, 500.0)
+    constituent = aerosol.constituent(
+        "tropical_typical",
+        month=4,
+        altitudes_m=altitudes,
+        path=offgrid_catalogue_path,
+        optics_root=wide_optics_root,
+    )
+    assert np.isfinite(_radiance(constituent, np.arange(0.0, 30001.0, 1000.0))).all()
+    assert_array_equal(constituent.altitudes_m, altitudes)
+
+
+def test_edited_extinction_is_not_silently_remapped(
+    offgrid_catalogue_path, wide_optics_root
+):
+    constituent = aerosol.constituent(
+        "tropical_typical",
+        month=4,
+        path=offgrid_catalogue_path,
+        optics_root=wide_optics_root,
+    )
+    constituent.extinction_per_m = 2 * constituent.extinction_per_m
+    with pytest.raises(ValueError, match="altitudes_m="):
+        _radiance(constituent, np.arange(0.0, 30001.0, 1000.0))
+
+
 def _count_hashes(monkeypatch):
     calls = []
     original = database._sha256

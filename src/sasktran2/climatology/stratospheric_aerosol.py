@@ -228,6 +228,9 @@ def profile(
         interval. Zero disables smoothing. Radius is unchanged.
     lower_extension : str
         ``"exponential_to_zero"`` (default) or ``"zero"`` outside the core.
+        Use ``"zero"`` when combining with
+        :mod:`sasktran2.climatology.tropospheric_aerosol`, which already
+        includes the aerosol below the observations.
     upper_extension : str
         ``"exponential"`` (default) or ``"zero"`` outside the core.
     lower_scale_height_m : float

@@ -92,6 +92,29 @@ above the WGS84 ellipsoid: MERRA2 geopotential heights are converted using
 latitude-dependent gravity and Earth radius, then offset by EGM2008 geoid
 undulation. The profile does not extend aerosol above the tropopause.
 
+Two options prepare a case for a model atmosphere. `ground_altitude_m` moves
+the whole profile vertically so that the selected column's surface lies at
+that altitude; the catalogue surface is the column's real terrain height,
+which can be several hundred metres, so use `ground_altitude_m=0.0` when the
+model's ground is at 0 m. `smoothing_fwhm_m` applies a Gaussian of that full
+width at half maximum between the surface and the tropopause, keeping the AOD
+at every wavelength. It is off by default: unlike the noisy satellite
+observations behind the stratospheric climatology, the catalogue's structure
+(boundary-layer top, elevated dust and smoke layers) is MERRA2's, and widths
+above a few hundred metres blur it.
+
+```{code-cell}
+for fwhm in (0.0, 1000.0):
+    smoothed = aerosol.profile(
+        "nh_midlat_extreme", month=7, smoothing_fwhm_m=fwhm, ground_altitude_m=0.0
+    )
+    plt.plot(smoothed.extinction_per_m, smoothed.altitude_m / 1000, label=f"{fwhm:g} m")
+plt.xlabel("Extinction at 550 nm [m$^{-1}$]")
+plt.ylabel("Altitude above ground [km]")
+plt.legend(title="smoothing_fwhm_m")
+plt.grid(alpha=0.2)
+```
+
 To add a case to an atmosphere, use the constituent. Its extinction follows
 the catalogue spectra (250 nm to 40 um), and its single-scattering albedo and
 phase function come from the case's MERRA2 species mixture and relative
@@ -119,11 +142,23 @@ config.num_streams = 16
 
 atmosphere = sk.Atmosphere(model_geometry, config, wavelengths_nm=wavelengths_nm)
 atmosphere["tropospheric_aerosol"] = aerosol.constituent(
-    "tropical_typical",
-    month=7,
-    altitudes_m=atmosphere.model_geometry.altitudes(),
+    "tropical_typical", month=7, ground_altitude_m=0.0
 )
 ```
+
+The constituent is remapped onto the atmosphere's model altitudes when it is
+added, with the same AOD-conserving remap as `profile`, so its column AOD
+matches the catalogue on any model grid. Plain linear interpolation onto a
+coarse grid would not: on a 1 km grid it lost a median 24% of the AOD across
+the catalogue cases, mostly from the lowest few hundred metres. Pass
+`altitudes_m` to fix the grid yourself, for example to edit
+`extinction_per_m` before the calculation.
+
+When combining this constituent with
+`sk.climatology.stratospheric_aerosol`, create the stratospheric profile with
+`lower_extension="zero"`. Its default exponential taper below the
+observations models stratospheric aerosol reaching into the troposphere,
+which the tropospheric case already contains.
 
 Pass `optics_root` to use a local copy of the optics tables. Passing
 `optical_property` replaces the MERRA2 optics with your own, normalized to

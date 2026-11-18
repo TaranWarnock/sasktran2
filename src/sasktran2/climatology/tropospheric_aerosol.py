@@ -9,6 +9,7 @@ import numpy as np
 import xarray as xr
 from scipy.integrate import trapezoid
 from scipy.interpolate import PchipInterpolator
+from scipy.ndimage import gaussian_filter1d
 
 import sasktran2 as sk
 from sasktran2.constituent import ExtinctionScatterer
@@ -228,6 +229,8 @@ def profile(
     month: int,
     wavelength_nm: float = 550.0,
     altitudes_m: np.ndarray | None = None,
+    smoothing_fwhm_m: float = 0.0,
+    ground_altitude_m: float | None = None,
     version: str = "v1",
     path: str | Path | None = None,
     db_root: str | Path | None = None,
@@ -250,16 +253,27 @@ def profile(
     spans the surface to the tropopause; ``tropospheric_aod`` is that integral.
     At least one level must lie between the surface and the tropopause.
 
+    ``smoothing_fwhm_m`` (default 0, off) applies a Gaussian of that full width
+    at half maximum to the catalogue profile before remapping. It acts only
+    between the surface and the tropopause, never moves aerosol across them,
+    and keeps the column AOD exactly at every wavelength. Unlike the
+    stratospheric climatology, the catalogue is not noisy: its structure
+    (boundary-layer top, elevated dust and smoke layers) comes from MERRA2, so
+    smoothing is optional and widths above a few hundred metres blur it.
+
+    ``ground_altitude_m`` moves the whole profile vertically so that the
+    selected column's surface lies at that altitude, for example ``0.0`` for
+    a model atmosphere whose ground is at 0 m. The surface and tropopause move
+    with it. The default ``None`` keeps catalogue heights (above the WGS84
+    ellipsoid), whose surface is the real terrain height of the column, up to
+    several hundred metres.
+
     ``region`` flags each level as below the surface (-1), above the
     tropopause (0) or in the troposphere (1).
     """
-    return _profile(
-        load_dataset(version, path=path, db_root=db_root),
-        scenario,
-        month,
-        wavelength_nm,
-        altitudes_m,
-    )
+    data = load_dataset(version, path=path, db_root=db_root)
+    case = _prepared_case(data, scenario, month, smoothing_fwhm_m, ground_altitude_m)
+    return _profile(data, case, wavelength_nm, altitudes_m)
 
 
 def _cell_bounds(altitudes: np.ndarray) -> np.ndarray:
@@ -318,14 +332,126 @@ def _conservative_remap(
     return cell_aod / np.diff(target_bounds)
 
 
-def _profile(
+def _smoothing_matrix(
+    altitudes: np.ndarray, valid: np.ndarray, fwhm_m: float
+) -> np.ndarray:
+    """Gaussian smoothing matrix over the valid levels, reflected at their ends.
+
+    Mirroring the profile at the surface and tropopause makes the matrix
+    symmetric with rows and columns summing to one on a regular grid: the AOD
+    is kept exactly, none leaves the valid range, and a constant profile stays
+    constant up to both boundaries. Rows and columns of invalid levels are
+    zero.
+    """
+    indices = np.flatnonzero(valid)
+    matrix = np.zeros((len(altitudes), len(altitudes)))
+    if len(indices) == 0:
+        return matrix
+    spacing = np.diff(altitudes[indices])
+    if len(spacing) and not np.allclose(spacing, spacing[0], rtol=1e-9, atol=0.0):
+        msg = "Smoothing needs a regular catalogue altitude grid"
+        raise ValueError(msg)
+    if len(indices) == 1:
+        matrix[indices[0], indices[0]] = 1.0
+        return matrix
+    sigma = fwhm_m / np.sqrt(8.0 * np.log(2.0)) / spacing[0]
+    block = gaussian_filter1d(
+        np.eye(len(indices)), sigma, axis=0, mode="reflect", truncate=4.0
+    )
+    matrix[np.ix_(indices, indices)] = block
+    return matrix
+
+
+def _smooth(case: xr.Dataset, fwhm_m: float) -> xr.Dataset:
+    """Smooth a case's extinction between its surface and tropopause.
+
+    The same AOD-conserving operator is applied to the total spectral
+    extinction and to every species, so species still sum to the total.
+    """
+    altitudes = case.altitude_m.values
+    valid = (altitudes >= float(case.surface_altitude_m)) & (
+        altitudes <= float(case.tropopause_altitude_m)
+    )
+    widths = np.diff(_cell_bounds(altitudes))
+    matrix = _smoothing_matrix(altitudes, valid, fwhm_m)
+    case = case.copy()
+    for name in ("extinction_per_m", "species_extinction_550nm_per_m"):
+        values = case[name]
+        attrs = values.attrs
+        aod = values * xr.DataArray(widths, dims="altitude_m")
+        smoothed = xr.apply_ufunc(
+            lambda cell: np.moveaxis(
+                np.tensordot(matrix, np.moveaxis(cell, -1, 0), axes=1), 0, -1
+            ),
+            aod,
+            input_core_dims=[["altitude_m"]],
+            output_core_dims=[["altitude_m"]],
+        )
+        case[name] = (
+            (smoothed / xr.DataArray(widths, dims="altitude_m"))
+            .transpose(*values.dims)
+            .assign_attrs(attrs)
+        )
+    return case
+
+
+def _prepared_case(
     data: xr.Dataset,
     scenario: str,
     month: int,
+    smoothing_fwhm_m: float,
+    ground_altitude_m: float | None,
+) -> xr.Dataset:
+    """Select one case, optionally move it to the model ground and smooth it."""
+    selected_month = _validate_month(month)
+    names = data.scenario.values.tolist()
+    if names.count(scenario) != 1:
+        msg = f"Select an exact aerosol scenario; got {scenario!r}, available: {names}"
+        raise ValueError(msg)
+    try:
+        fwhm = float(smoothing_fwhm_m)
+    except (TypeError, ValueError):
+        fwhm = np.nan
+    if not np.isfinite(fwhm) or fwhm < 0:
+        msg = "smoothing_fwhm_m must be finite and nonnegative"
+        raise ValueError(msg)
+    shift = 0.0
+    case = data.sel(scenario=scenario, month=selected_month)
+    if ground_altitude_m is not None:
+        try:
+            ground = float(ground_altitude_m)
+        except (TypeError, ValueError):
+            ground = np.nan
+        if not np.isfinite(ground):
+            msg = "ground_altitude_m must be finite or None"
+            raise ValueError(msg)
+        shift = ground - float(case.surface_altitude_m)
+        case = case.assign_coords(
+            altitude_m=case.altitude_m.copy(data=case.altitude_m.values + shift)
+        )
+        for name in ("surface_altitude_m", "tropopause_altitude_m"):
+            case[name] = case[name] + shift
+            case[name].attrs["units"] = "m"
+    if fwhm > 0:
+        case = _smooth(case, fwhm)
+    case.attrs.update(
+        scenario=scenario,
+        month=selected_month,
+        smoothing_fwhm_m=fwhm,
+        ground_altitude_m=(
+            "catalogue" if ground_altitude_m is None else float(ground_altitude_m)
+        ),
+        vertical_shift_m=shift,
+    )
+    return case
+
+
+def _profile(
+    data: xr.Dataset,
+    case: xr.Dataset,
     wavelength_nm: float,
     altitudes_m: np.ndarray | None,
 ) -> xr.Dataset:
-    selected_month = _validate_month(month)
     try:
         wavelength = float(wavelength_nm)
     except (TypeError, ValueError):
@@ -333,16 +459,11 @@ def _profile(
     if not np.isfinite(wavelength) or wavelength <= 0:
         msg = "wavelength_nm must be finite and positive"
         raise ValueError(msg)
-    names = data.scenario.values.tolist()
-    if names.count(scenario) != 1:
-        msg = f"Select an exact aerosol scenario; got {scenario!r}, available: {names}"
-        raise ValueError(msg)
     wavelengths = data.wavelength_nm.values
     if wavelength < wavelengths[0] or wavelength > wavelengths[-1]:
         msg = f"wavelength_nm must be within {wavelengths[0]:g}-{wavelengths[-1]:g} nm"
         raise ValueError(msg)
 
-    case = data.sel(scenario=scenario, month=selected_month)
     source_altitudes = _grid(case.altitude_m.values, "Catalogue altitude_m")
     source_extinction = case.extinction_per_m.interp(wavelength_nm=wavelength).values
     target = (
@@ -389,8 +510,16 @@ def _profile(
         result[name] = case[name]
     result.attrs.update(data.attrs)
     result.attrs.update(
-        scenario=scenario,
-        month=selected_month,
+        {
+            name: case.attrs[name]
+            for name in (
+                "scenario",
+                "month",
+                "smoothing_fwhm_m",
+                "ground_altitude_m",
+                "vertical_shift_m",
+            )
+        },
         extinction_wavelength_nm=wavelength,
         source_tropopause_field="TROPPB",
         profile_extension="none; extinction is zero above the tropopause",
@@ -580,6 +709,78 @@ def _merra2_optics(
     return result
 
 
+class TroposphericAerosolConstituent(ExtinctionScatterer):
+    """MERRA2 tropospheric aerosol case as an extinction constituent.
+
+    Created by :func:`constituent`. When that call had no ``altitudes_m``, the
+    profile is remapped onto the atmosphere's model altitudes, conserving AOD,
+    each time it is added to an atmosphere with a different grid. Until then
+    it holds the catalogue grid.
+    """
+
+    def __init__(
+        self,
+        data: xr.Dataset,
+        case: xr.Dataset,
+        wavelength_nm: float,
+        altitudes_m: np.ndarray | None,
+        optical_property: OpticalProperty,
+        parameterized_by_altitude: bool,
+    ) -> None:
+        self._source = (data, case, wavelength_nm, optical_property)
+        self._parameterized_by_altitude = parameterized_by_altitude
+        self._follows_atmosphere = altitudes_m is None
+        self._initialize(altitudes_m)
+
+    def _initialize(self, altitudes_m: np.ndarray | None) -> None:
+        data, case, wavelength_nm, optical_property = self._source
+        selected = _profile(data, case, wavelength_nm, altitudes_m)
+        altitudes = selected.altitude_m.values
+        extinction = selected.extinction_per_m.values
+        kwargs = {}
+        if self._parameterized_by_altitude:
+            # Optics are tabulated on the catalogue grid; levels outside it are
+            # outside the troposphere, where the extinction is zero.
+            kwargs["altitude_m"] = np.clip(
+                altitudes, case.altitude_m.values[0], case.altitude_m.values[-1]
+            )
+        ExtinctionScatterer.__init__(
+            self, optical_property, altitudes, extinction, wavelength_nm, **kwargs
+        )
+        self._prepared_extinction = extinction.copy()
+
+    def _match_grid(self, atmo) -> None:
+        if not self._follows_atmosphere:
+            return
+        geometry = getattr(atmo, "model_geometry", None)
+        if geometry is None:
+            return
+        target = np.asarray(geometry.altitudes(), dtype=float)
+        if target.shape == self._altitudes_m.shape and np.array_equal(
+            target, self._altitudes_m
+        ):
+            return
+        if not np.array_equal(
+            np.asarray(self._extinction_per_m), self._prepared_extinction
+        ):
+            msg = (
+                "This tropospheric aerosol constituent follows the atmosphere's "
+                "altitude grid, so its extinction_per_m cannot be changed before "
+                "it is remapped. Create it with altitudes_m="
+                "atmosphere.model_geometry.altitudes() to edit its extinction."
+            )
+            raise ValueError(msg)
+        self._initialize(target)
+
+    def add_to_atmosphere(self, atmo) -> None:
+        self._match_grid(atmo)
+        super().add_to_atmosphere(atmo)
+
+    def register_derivative(self, atmo, name: str) -> None:
+        self._match_grid(atmo)
+        super().register_derivative(atmo, name)
+
+
 def constituent(
     scenario: str,
     *,
@@ -587,13 +788,39 @@ def constituent(
     optical_property: OpticalProperty | None = None,
     wavelength_nm: float = 550.0,
     altitudes_m: np.ndarray | None = None,
+    smoothing_fwhm_m: float = 0.0,
+    ground_altitude_m: float | None = None,
     version: str = "v1",
     path: str | Path | None = None,
     db_root: str | Path | None = None,
     optics_root: str | Path | None = None,
     max_legendre_moments: int | None = None,
-) -> ExtinctionScatterer:
+) -> TroposphericAerosolConstituent:
     """Create an extinction-normalized aerosol constituent.
+
+    For example, add a typical tropical July case to an atmosphere whose
+    ground is at 0 m::
+
+        atmosphere["tropospheric_aerosol"] = (
+            sk.climatology.tropospheric_aerosol.constituent(
+                "tropical_typical", month=7, ground_altitude_m=0.0
+            )
+        )
+
+    With the default ``altitudes_m=None`` the profile is remapped onto the
+    atmosphere's model altitudes when it is added, conserving AOD: the
+    trapezoid integral over the model grid equals the catalogue column AOD.
+    Plain linear interpolation onto a coarse grid would not; on a 1 km grid
+    it lost a median 24% of the AOD across the catalogue cases. Passing
+    ``altitudes_m`` fixes the grid instead, as in :func:`profile`.
+    ``smoothing_fwhm_m`` and ``ground_altitude_m`` are described in
+    :func:`profile`; smoothing applies to the species mixture as well, so the
+    optics stay consistent with the extinction.
+
+    When combined with :mod:`sasktran2.climatology.stratospheric_aerosol`,
+    create that profile with ``lower_extension="zero"``. Its default
+    exponential taper below the observations models stratospheric aerosol
+    reaching into the troposphere, which this constituent already includes.
 
     By default the constituent is MERRA2-consistent and scalar only
     (``nstokes=1``): its extinction follows the catalogue spectra at every
@@ -627,19 +854,17 @@ def constituent(
     catalogue's own spectra.
     """
     data = load_dataset(version, path=path, db_root=db_root)
-    selected = _profile(data, scenario, month, wavelength_nm, altitudes_m)
-    altitudes = selected.altitude_m.values
-    kwargs = {}
-    if optical_property is None:
-        case = data.sel(scenario=scenario, month=_validate_month(month))
+    case = _prepared_case(data, scenario, month, smoothing_fwhm_m, ground_altitude_m)
+    merra2_optics = optical_property is None
+    if merra2_optics:
         optical_property = _MERRA2MixedAerosol(
             db=_merra2_optics(case, optics_root, max_legendre_moments)
         )
-        kwargs["altitude_m"] = altitudes
-    return sk.constituent.ExtinctionScatterer(
-        optical_property,
-        altitudes,
-        selected.extinction_per_m.values,
+    return TroposphericAerosolConstituent(
+        data,
+        case,
         wavelength_nm,
-        **kwargs,
+        altitudes_m,
+        optical_property,
+        parameterized_by_altitude=merra2_optics,
     )
