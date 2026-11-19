@@ -9,9 +9,10 @@ python tools/databases/tropospheric_aerosol/build.py \
   --optics-root /path/to/MERRA-2-Versions/v0.0.0
 ```
 
-By default, the builder reads 1980 through the last complete calendar year
-from GES DISC, downloading each day's granules to temporary storage and
-deleting them after processing (see "Daily staging" below). Configure
+By default, the builder reads 2016 through the last complete calendar year;
+the recent decade represents the current aerosol climate, and MERRA-2 goes
+back to 1980 if a longer period is needed. Data are read from GES DISC,
+downloading each day's granules to temporary storage and deleting them after processing (see "Daily staging" below). Configure
 Earthdata Login credentials in the user's netrc. To use existing
 granules instead, pass `--data-root` with `M2I1NXASM`, `M2I3NVAER`, and
 `M2I3NVASM` subdirectories. Pass `--start-year` and `--end-year` to pin the
@@ -127,8 +128,8 @@ checkpoint identity.
 Set `START_YEAR` and
 `END_YEAR` to change the period, and set
 `OUTPUT_DIR` to choose where the catalogue and build report are written. For
-example, a complete-history run can be submitted with
-`START_YEAR=1980,END_YEAR=2025`; retain a separate output directory for this
+example, the reference ten-year run can be submitted with
+`START_YEAR=2016,END_YEAR=2025`; keep its output directory separate from the
 one-year test. Earthdata credentials must be available in the submitting
 user's netrc file. The submission helper creates
 `~/scratch/output/sasktran` before submission and puts the Slurm log there;
@@ -137,7 +138,7 @@ default.
 
 ```bash
 bash tools/databases/tropospheric_aerosol/submit.sh \
-  --export=ALL,OPTICS_ROOT=/path/to/MERRA-2-Versions/v0.0.0,START_YEAR=1980,END_YEAR=2025
+  --export=ALL,OPTICS_ROOT=/path/to/MERRA-2-Versions/v0.0.0,START_YEAR=2016,END_YEAR=2025
 ```
 
 For local runs, install the optional `merra2-build` dependencies and set

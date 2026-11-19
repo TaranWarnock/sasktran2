@@ -35,6 +35,9 @@ import requests
 import xarray as xr
 
 _MONTHS = (1, 4, 7, 10)
+# The most recent decade represents the current aerosol climate; the end year
+# defaults to the last complete calendar year.
+DEFAULT_START_YEAR = 2016
 _BANDS = {
     "sh_midlat": (-55.0, -35.0),
     "tropical": (-20.0, 20.0),
@@ -2131,7 +2134,7 @@ def build_catalogue(
     output: Path,
     *,
     data_root: Path | None = None,
-    start_year: int = 1980,
+    start_year: int = DEFAULT_START_YEAR,
     end_year: int = datetime.now(timezone.utc).year - 1,
     reservoir_size: int = 50000,
     seed: int = 20261021,
@@ -2542,7 +2545,7 @@ def main() -> None:
         default=Path("src/sasktran2/_data/tropospheric_aerosol"),
         help="Output catalogue directory",
     )
-    parser.add_argument("--start-year", type=int, default=1980)
+    parser.add_argument("--start-year", type=int, default=DEFAULT_START_YEAR)
     parser.add_argument(
         "--end-year", type=int, default=datetime.now(timezone.utc).year - 1
     )
