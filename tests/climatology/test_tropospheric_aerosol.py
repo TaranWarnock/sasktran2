@@ -2194,8 +2194,9 @@ _CHECKPOINT_SPECIES_SHARES = np.arange(1.0, len(build._COMPONENTS) + 1.0) / sum(
 )
 
 
+@pytest.mark.parametrize("stage_daily", [True, False])
 def test_month_checkpoint_restores_reservoir_and_skips_completed_days(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, stage_daily
 ):
     month = 1
     config = {
@@ -2347,7 +2348,7 @@ def test_month_checkpoint_restores_reservoir_and_skips_completed_days(
         42,
         checkpoint_path,
         config,
-        stage_daily=True,
+        stage_daily=stage_daily,
     )
     assert len(records) == (
         len(build._BANDS) * len(build._AEROSOL_TYPES) * len(build._TIERS)
@@ -2379,13 +2380,20 @@ def test_month_checkpoint_restores_reservoir_and_skips_completed_days(
             record["extinction_per_m"][:, 0],
         )
     # Every selection is the same column on 2024-01-01: one day, read once,
-    # with range requests although the daily pass staged its granules.
+    # and opened the way the daily pass opens its granules. A staged read
+    # shares one stager over the selected days, closed afterwards.
     assert len(column_reads) == 1
-    day, columns, stage_daily, stager = column_reads[0]
+    day, columns, read_staged, stager = column_reads[0]
     assert day == build.date(2024, 1, 1)
     assert columns == [(0, 0, 0)]
-    assert stage_daily is False
-    assert stager is None
+    assert read_staged is stage_daily
+    if stage_daily:
+        assert isinstance(stager, build._DayStager)
+        assert stager._days == [build.date(2024, 1, 1)]
+        assert stager._checkpointing is False
+        assert stager._executor._shutdown
+    else:
+        assert stager is None
 
 
 def test_multi_year_checkpoint_validates_only_days_in_the_month(tmp_path, monkeypatch):

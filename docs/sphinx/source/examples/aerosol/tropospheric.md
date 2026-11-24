@@ -267,8 +267,8 @@ calendar year, so the scenarios represent the current aerosol climate; pass
 `--start-year` and `--end-year` to choose another period. It downloads each
 day's source granules from GES DISC to temporary storage and deletes them after
 processing; with `--no-stage-daily` it instead streams them using authenticated
-HTTP range reads. The selected columns are then always read with range
-requests. Create an Earthdata Login netrc entry. For a quick local run
+HTTP range reads. The days holding the selected columns are read the same way.
+Create an Earthdata Login netrc entry. For a quick local run
 of one year, install the optional build dependencies:
 
 ```bash

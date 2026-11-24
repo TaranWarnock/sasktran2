@@ -1655,7 +1655,6 @@ def _read_column_spectra(
 
     The day's granules are opened once: remote granules are downloaded first
     when ``stage_daily`` is set and streamed with range requests otherwise.
-    _process_month reads selected columns with ``stage_daily=False``.
     """
     with _open_daily_granules(
         day,
@@ -2188,9 +2187,11 @@ def _process_month(
                 )
 
     # Each selected column is read once, even when it was chosen for several
-    # types or loadings, and each day's granules are opened once. Remote
-    # columns are read with HTTP range requests whatever stage_daily says:
-    # staging would download about 6.6 GB of whole granules per column.
+    # types or loadings, and each day's granules are opened once. Remote days
+    # are staged like the sampling pass (the next selected day downloads while
+    # one is read): a range-read column needs about 1,500 small requests, one
+    # per variable and level, which took about 4 minutes per column on DRAC,
+    # while staging a whole day took about 2 minutes.
     def source_column(band: str, index: int) -> tuple[int, int, int]:
         reservoir = reservoirs[band]
         return (
@@ -2202,26 +2203,43 @@ def _process_month(
     columns_by_day: dict[str, set[tuple[int, int, int]]] = {}
     for band, _, _, index, *_, timestamp in selections:
         columns_by_day.setdefault(timestamp[:10], set()).add(source_column(band, index))
+    selected_days = [date.fromisoformat(text) for text in sorted(columns_by_day)]
+    column_stager = (
+        _DayStager(selected_days, checkpointing=False)
+        if stage_daily and data_root is None
+        else None
+    )
+    if data_root is not None:
+        access = ""
+    elif stage_daily:
+        access = " from staged granules"
+    else:
+        access = " with HTTP range requests"
     columns = {}
-    for day_text in sorted(columns_by_day):
-        day_columns = sorted(columns_by_day[day_text])
-        logging.info(
-            "Reading %d selected MERRA2 column(s) for month %02d from %s%s",
-            len(day_columns),
-            month,
-            day_text,
-            "" if data_root is not None else " with HTTP range requests",
-        )
-        profiles = _read_column_spectra(
-            date.fromisoformat(day_text),
-            day_columns,
-            data_root,
-            geoid_undulation,
-            efficiency_profiles,
-            wavelengths_nm,
-            stage_daily=False,
-        )
-        columns.update(zip(day_columns, profiles, strict=True))
+    try:
+        for day in selected_days:
+            day_columns = sorted(columns_by_day[day.isoformat()])
+            logging.info(
+                "Reading %d selected MERRA2 column(s) for month %02d from %s%s",
+                len(day_columns),
+                month,
+                day.isoformat(),
+                access,
+            )
+            profiles = _read_column_spectra(
+                day,
+                day_columns,
+                data_root,
+                geoid_undulation,
+                efficiency_profiles,
+                wavelengths_nm,
+                stage_daily=stage_daily,
+                stager=column_stager,
+            )
+            columns.update(zip(day_columns, profiles, strict=True))
+    finally:
+        if column_stager is not None:
+            column_stager.close()
 
     reference_index = _reference_wavelength_index(wavelengths_nm)
     result = []
@@ -2726,8 +2744,9 @@ def main() -> None:
         default=True,
         help=(
             "Download each remote day's granules to temporary storage before "
-            "sampling them (default); --no-stage-daily streams them with HTTP "
-            "range reads instead. Selected columns are always range-read"
+            "reading them (default), for both the sampling pass and the "
+            "selected columns; --no-stage-daily streams them with HTTP range "
+            "reads instead"
         ),
     )
     parser.add_argument(

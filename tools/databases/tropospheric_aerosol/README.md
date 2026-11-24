@@ -125,11 +125,15 @@ Use the same `OUTPUT_DIR` and build settings when resuming. `STAGE_DAILY` only
 changes how remote input files are read; it does not change the climatology or
 checkpoint identity.
 
-Staging applies to the sampling pass only. After sampling, each month reads its
-selected columns (up to 60: three bands, five aerosol types, four loadings)
-with HTTP range requests whatever `STAGE_DAILY` is set to. Staging whole
-granules for them would download about 6.6 GB per selected day to read one
-column. Each selected column is read once, even when several cases chose it.
+After sampling, each month reads its selected columns (up to 60: three bands,
+five aerosol types, four loadings). Staging applies here too: each day holding
+a selected column is downloaded whole while the previous one is read, and
+removed afterwards. Each selected column is read once, even when several cases
+chose it, and each day is downloaded once. Range reads are much slower for
+this pass: a column needs about 1,500 small requests (one per variable and
+model level), which took about 4 minutes per column on DRAC, while staging a
+day took about 2 minutes. Staging adds up to about 6.6 GB of downloads per
+selected day (at most 240 days, about 1.6 TB, for a multi-year build).
 
 Set `START_YEAR` and
 `END_YEAR` to change the period, and set
