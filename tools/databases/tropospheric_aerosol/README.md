@@ -125,6 +125,12 @@ Use the same `OUTPUT_DIR` and build settings when resuming. `STAGE_DAILY` only
 changes how remote input files are read; it does not change the climatology or
 checkpoint identity.
 
+Staging applies to the sampling pass only. After sampling, each month reads its
+selected columns (up to 60: three bands, five aerosol types, four loadings)
+with HTTP range requests whatever `STAGE_DAILY` is set to. Staging whole
+granules for them would download about 6.6 GB per selected day to read one
+column. Each selected column is read once, even when several cases chose it.
+
 Set `START_YEAR` and
 `END_YEAR` to change the period, and set
 `OUTPUT_DIR` to choose where the catalogue and build report are written. For
@@ -171,20 +177,39 @@ reservoir bounds memory while estimating monthly percentile windows; the seed,
 reservoir size, candidate counts, and selected source columns are recorded in
 the build report.
 
-Profiles are mapped to the 0-20 km, 250 m catalogue grid conservatively: each
-layer's AOD is spread over its height range, binned into cells around the grid
-points, and AOD below the surface or above the tropopause is folded into the
-nearest valid point. The trapezoid integral of each catalogue profile on its
-own grid therefore equals the native-layer tropospheric AOD. `candidate_count`
-is the estimated number of valid columns in the loading window, scaled from
-the sampled reservoir to all valid columns.
+Loading levels are chosen separately for each of the five aerosol types
+(sulfate, dust, sea salt, black carbon, organic carbon): the windows are
+percentiles of the type's own tropospheric 550 nm AOD, with the same bands,
+months and percentiles for every type. One reservoir per band serves all
+types, because its sampling keys depend only on cosine latitude and a random
+draw, not on AOD. It keeps each sampled column's AOD per species and its
+tropospheric profile per type. Within a window, the selected column (with
+positive AOD of the type) is closest to the window's median profile shape of
+that type and its median mix of the type's species: the size bins for dust and
+sea salt, the hydrophilic and hydrophobic parts for black and organic carbon.
+Sulfate has one species, so only its shape counts.
 
-Besides total spectral extinction, each case stores
-`species_extinction_550nm_per_m` (550 nm extinction per MERRA2 species bin,
-mapped with the same conservative scheme, so the species sum to the total) and
+The selected columns are mapped to the catalogue grid conservatively over
+their whole height: each layer's AOD is spread over its height range, binned
+into cells around the grid points, and AOD below the surface is folded into
+the first point above it. The grid is 250 m apart up to 20 km, which holds the
+troposphere, then 1 km to 50 km and 2 km to 84 km, above the MERRA2 model top
+(0.01 hPa, about 80 km). The profiles therefore hold the whole column,
+including aerosol above the tropopause; any AOD above the top point folds into
+it. sasktran2 cuts profiles at the tropopause by default
+(`cut_at_tropopause=True`). The trapezoid integral of each catalogue profile on
+its own grid equals the native-layer column AOD. Selection uses only the
+tropospheric profiles, on the 0-20 km part of the grid. `candidate_count` is the
+estimated number of valid columns in the loading window, scaled from the
+sampled reservoir to all valid columns.
+
+Each case (scenario, aerosol type, month) holds only its type's species. It
+stores spectral extinction, `species_extinction_550nm_per_m` (550 nm
+extinction per MERRA2 species bin, mapped with the same conservative scheme,
+so the species sum to the total; zero for other types' species) and
 `relative_humidity` on the grid, clipped to 0-0.99 as in the optical tables.
 Together with the MERRA2 optical tables these give each case's single
-scattering albedo and phase function. The catalogue schema is version 2. The
+scattering albedo and phase function. The catalogue schema is version 3. The
 wavelength grid is the union of the five tables' wavelengths within their
 shared range, rounded to 0.01 nm so float32 copies of one wavelength merge.
 

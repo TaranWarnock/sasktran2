@@ -32,8 +32,8 @@ See the :ref:`stratospheric aerosol example <_example_stratospheric_aerosol>`.
 
 Tropospheric Aerosol Reference Scenarios
 ----------------------------------------
-Monthly MERRA2 aerosol extinction profiles for the SAGE latitude bands and
-loading levels.
+Monthly MERRA2 aerosol extinction profiles for the SAGE latitude bands, with
+loading levels for each of the five MERRA2 aerosol types.
 
 .. autosummary::
     :toctree: generated/

@@ -7,48 +7,64 @@ kernelspec:
 ---
 
 (_example_tropospheric_aerosol)=
-# Add MERRA2 tropospheric aerosol
+# Add tropospheric aerosol
 
-Use `sk.climatology.tropospheric_aerosol` to inspect a monthly MERRA2 aerosol
-reference profile:
+Use `sk.climatology.tropospheric_aerosol` to add MERRA2 aerosol reference
+scenarios to an existing atmosphere, one aerosol type at a time:
 
-```{code-cell}
-import numpy as np
-import matplotlib.pyplot as plt
+```python
 import sasktran2 as sk
 
 aerosol = sk.climatology.tropospheric_aerosol
-profile = aerosol.profile(
-    "tropical_typical",
-    month=7,
-    wavelength_nm=550.,
+atmosphere["dust"] = aerosol.constituent(
+    "tropical_elevated", aerosol_type="dust", month=7, ground_altitude_m=0.0
 )
-
-plt.plot(profile.extinction_per_m, profile.altitude_m / 1000)
-plt.xlabel("Extinction at 550 nm [m$^{-1}$]")
-plt.ylabel("Altitude [km]")
-plt.grid(alpha=0.2)
+atmosphere["sulfate"] = aerosol.constituent(
+    "tropical_typical", aerosol_type="sulfate", month=7, ground_altitude_m=0.0
+)
 ```
+
+Each constituent holds one of the five MERRA2 aerosol types, from an actual
+MERRA2 column chosen for that type's loading. Build a mixture by adding one
+constituent per type, under different names, each at its own loading level. The
+helper supplies extinction from 250 nm to 40 microns, with single-scattering
+albedo and phase function from the type's MERRA2 species and relative humidity.
+It supports scalar calculations only (`num_stokes = 1`), and needs the engine
+settings shown in the radiance example below.
+
+You can add these constituents alongside your chosen gases and Rayleigh
+scattering. To also include stratospheric aerosol, add
+{ref}`stratospheric aerosol <_example_stratospheric_aerosol>` created with
+`lower_extension="zero"`. Its default exponential taper below the observations
+models stratospheric aerosol reaching into the troposphere, which the
+tropospheric cases already contain.
 
 ## Choose a scenario
 
-Names combine a SAGE-style latitude band with a loading level. The available
-bands are southern midlatitudes (`sh_midlat`, 55–35°S), the tropics (`tropical`,
-20°S–20°N), and northern midlatitudes (`nh_midlat`, 35–55°N). Each band has
-`low`, `typical`, `elevated`, and `extreme` cases.
+Choose an aerosol type, then combine a latitude band with a loading level and
+pick a month, for example dust in `nh_midlat_elevated` in month 1. Pass the type
+as `aerosol_type`, by name or code (either case):
 
-Month selection is exact and follows the CAIRT scenario months: 1, 4, 7, or 10.
-The loading levels use area-weighted monthly tropospheric AOD percentiles. Each
-case is an actual MERRA2 column selected from a narrow percentile window. Of
-the sampled columns in that window, the one chosen is closest to both the
-group's median vertical profile shape (extinction divided by column AOD) and
-its median composition (the share of 550 nm AOD from sulfate, dust, sea salt,
-black carbon, and organic carbon). Each case therefore has a typical aerosol
-mix for its band, month, and loading rather than whatever one column happened
-to contain, and the choice does not favour lower or higher loading within the
-window. The catalogue records the selected column's shares
-(`selection_type_aod_fraction`) and the window's median shares
-(`candidate_median_type_aod_fraction`):
+| Aerosol type | `aerosol_type` | MERRA2 species |
+| --- | --- | --- |
+| Sulfate | `"sulfate"` or `"SU"` | `SO4` |
+| Dust | `"dust"` or `"DU"` | five size bins, `DU001`–`DU005` |
+| Sea salt | `"sea_salt"` or `"SS"` | five size bins, `SS001`–`SS005` |
+| Black carbon | `"black_carbon"` or `"BC"` | hydrophilic and hydrophobic |
+| Organic carbon | `"organic_carbon"` or `"OC"` | hydrophilic and hydrophobic |
+
+There are twelve scenarios for each type, each available for months 1, 4, 7,
+and 10:
+
+| Latitude band | Name prefix | Available loading levels |
+| --- | --- | --- |
+| Southern midlatitudes, 55–35°S | `sh_midlat` | `low`, `typical`, `elevated`, `extreme` |
+| Tropics, 20°S–20°N | `tropical` | `low`, `typical`, `elevated`, `extreme` |
+| Northern midlatitudes, 35–55°N | `nh_midlat` | `low`, `typical`, `elevated`, `extreme` |
+
+Start with `typical`, then use the other levels to explore the effect of aerosol
+loading. Each type has its own levels, from area-weighted percentiles of that
+type's monthly tropospheric 550 nm optical depth within each latitude band:
 
 | Loading | AOD percentile window |
 | --- | --- |
@@ -57,124 +73,203 @@ window. The catalogue records the selected column's shares
 | `elevated` | P90 ± 3 percentile points |
 | `extreme` | P99 ± 0.5 percentile points |
 
-The catalogue uses the blended MERRA2 tropopause pressure (`TROPPB`) to define
-the tropospheric column. Extinction is calculated from the aerosol mass mixing
-ratios, air density, relative humidity, and species/radius-bin mass-extinction
-efficiencies. The default reference wavelength is 550 nm; other wavelengths
-within the bundled optical-table coverage can be selected:
+Of the sampled columns in each window, the one chosen is closest to both the
+window's median vertical profile shape of the type (its extinction divided by
+its optical depth) and the window's median mix of the type's species: the size
+bins for dust and sea salt, or the hydrophilic share for black and organic
+carbon. Sulfate has a single species, so only its shape counts. Each case
+therefore has a typical profile and particle mix for its type, band, month, and
+loading. The catalogue records the selected column's species shares
+(`selection_species_aod_fraction`) and the window's median shares
+(`candidate_median_species_aod_fraction`).
+
+Because each type is ranked separately, the dust `extreme` column in a band is
+usually a different MERRA2 column from the sulfate `extreme` one. Adding several
+types combines aerosol from different places and times, each typical for its
+own loading level.
+
+You can list the scenarios and their selected columns in Python.
+`selection_aod_550nm` is the selected column's optical depth of the type, and
+`column_total_aod_550nm` that of all its aerosol:
 
 ```{code-cell}
-profile = aerosol.profile(
-    "nh_midlat_elevated",
-    month=1,
-    wavelength_nm=870.,
-)
-profile[["extinction_per_m", "selection_aod_550nm", "tropopause_altitude_m"]]
-```
+import numpy as np
+import matplotlib.pyplot as plt
+import sasktran2 as sk
 
-List available cases and their selected-column metadata:
-
-```{code-cell}
-aerosol.scenarios(month=10)[
-    ["latitude_band", "loading", "selection_aod_550nm", "selected_time"]
+aerosol = sk.climatology.tropospheric_aerosol
+aerosol.scenarios(month=7, aerosol_type="dust")[
+    [
+        "latitude_band",
+        "loading",
+        "selection_aod_550nm",
+        "column_total_aod_550nm",
+        "selected_time",
+    ]
 ]
 ```
 
-The profile helper returns extinction on its packaged 250 m altitude grid or
-remaps it to a caller-provided grid. The remap conserves AOD: each level gets
-the catalogue AOD in its trapezoid cell divided by the cell width, so the
-trapezoid integral over any grid that spans the surface to the tropopause
-equals the catalogue column AOD. Extinction is zero below the surface and
-above the tropopause, and the `region` variable flags those levels as -1 and
-0 (1 marks the troposphere). `tropospheric_aod` is the trapezoid integral of
-the returned profile. Profile altitudes are geometric heights
-above the WGS84 ellipsoid: MERRA2 geopotential heights are converted using
-latitude-dependent gravity and Earth radius, then offset by EGM2008 geoid
-undulation. The profile does not extend aerosol above the tropopause.
+## Compare the profiles
 
-Two options prepare a case for a model atmosphere. `ground_altitude_m` moves
-the whole profile vertically so that the selected column's surface lies at
-that altitude; the catalogue surface is the column's real terrain height,
-which can be several hundred metres, so use `ground_altitude_m=0.0` when the
-model's ground is at 0 m. `smoothing_fwhm_m` applies a Gaussian of that full
-width at half maximum between the surface and the tropopause, keeping the AOD
-at every wavelength. It is off by default: unlike the noisy satellite
-observations behind the stratospheric climatology, the catalogue's structure
-(boundary-layer top, elevated dust and smoke layers) is MERRA2's, and widths
-above a few hundred metres blur it.
+Use `profile()` to inspect extinction before adding a scenario. The extinction
+is at 550 nm by default, in m⁻¹; pass `wavelength_nm` for another catalogue
+wavelength. Altitude is in metres.
+
+```{code-cell}
+types = {
+    "sulfate": "Sulfate",
+    "dust": "Dust",
+    "sea_salt": "Sea salt",
+    "black_carbon": "Black carbon",
+    "organic_carbon": "Organic carbon",
+}
+fig, axes = plt.subplots(1, 5, figsize=(16, 5), sharey=True)
+for ax, (aerosol_type, title) in zip(axes, types.items()):
+    for loading in ["low", "typical", "elevated", "extreme"]:
+        profile = aerosol.profile(
+            f"tropical_{loading}",
+            aerosol_type=aerosol_type,
+            month=7,
+            ground_altitude_m=0.0,
+        )
+        troposphere = profile.region == 1
+        ax.semilogx(
+            profile.extinction_per_m.where(troposphere),
+            profile.altitude_m / 1000,
+            label=loading,
+        )
+    ax.set(title=f"{title}, tropics, July", xlabel="Extinction at 550 nm [m$^{-1}$]",
+           ylim=(0, 18))
+    ax.grid(alpha=0.2)
+axes[0].set_ylabel("Altitude above ground [km]")
+axes[-1].legend()
+fig.tight_layout()
+```
+
+The catalogue stores the whole MERRA2 column, from the surface to above the
+model top near 80 km, including aerosol above the tropopause. Its grid is
+250 m apart up to 20 km and coarser above. By default (`cut_at_tropopause=True`) profiles stop at
+the tropopause, so extinction is zero below the surface and above the
+tropopause. The `region` variable flags those levels as -1 and 0 and marks the
+troposphere with 1; the plot uses it to leave out the zero levels. Profile
+altitudes are geometric heights above the WGS84 ellipsoid, converted from MERRA2
+geopotential heights with the EGM2008 geoid. Pass `altitudes_m` to remap the
+profile to your own grid. The remap conserves optical depth: each level gets the
+catalogue optical depth in its trapezoid cell divided by the cell width, so
+`tropospheric_aod`, the trapezoid integral of the returned profile, equals the
+catalogue tropospheric optical depth on any grid that spans the troposphere.
+
+## Adjust smoothing and ground altitude
+
+The defaults keep the MERRA2 column as it is:
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| `ground_altitude_m` | `None` | Keeps the column's real terrain height, which can be several hundred metres. Set it to move the whole profile so its surface lies at that altitude, for example `0.` when the model's ground is at 0 m. |
+| `smoothing_fwhm_m` | `0.` | Applies a Gaussian of this full width at half maximum between the surface and the top of the profile, preserving optical depth at every wavelength. It acts on the 250 m part of the grid (up to 20 km); an uncut profile is not smoothed above that. |
+| `cut_at_tropopause` | `True` | Stops the profile at the tropopause. Set `False` to keep the whole MERRA2 column; `aod` is then the whole profile's optical depth and `tropospheric_aod` the part below the tropopause. That part overlaps stratospheric aerosol, mostly sulfate, so don't combine it with the stratospheric constituent without care. |
+| `altitudes_m` | `None` | Remaps the constituent onto the atmosphere's model altitudes when it is added. Set a grid to fix it yourself, for example to edit `extinction_per_m` before the calculation. |
+
+Smoothing is off by default. Unlike the noisy satellite observations behind the
+stratospheric scenarios, the catalogue's structure (boundary-layer top, elevated
+dust and smoke layers) is MERRA2's, and widths above a few hundred metres blur
+it. The same options work with `profile()`, so you can plot a customised profile
+first:
 
 ```{code-cell}
 for fwhm in (0.0, 1000.0):
     smoothed = aerosol.profile(
-        "nh_midlat_extreme", month=7, smoothing_fwhm_m=fwhm, ground_altitude_m=0.0
+        "nh_midlat_extreme",
+        aerosol_type="dust",
+        month=7,
+        smoothing_fwhm_m=fwhm,
+        ground_altitude_m=0.0,
     )
     plt.plot(smoothed.extinction_per_m, smoothed.altitude_m / 1000, label=f"{fwhm:g} m")
 plt.xlabel("Extinction at 550 nm [m$^{-1}$]")
 plt.ylabel("Altitude above ground [km]")
+plt.ylim(0, 18)
 plt.legend(title="smoothing_fwhm_m")
 plt.grid(alpha=0.2)
 ```
 
-To add a case to an atmosphere, use the constituent. Its extinction follows
-the catalogue spectra (250 nm to 40 um), and its single-scattering albedo and
-phase function come from the case's MERRA2 species mixture and relative
-humidity, using the MERRA2 aerosol optics tables. It supports scalar
-calculations only (`num_stokes = 1`).
+The constituent's remap onto the model grid matters on coarse grids: plain
+linear interpolation onto a 1 km grid lost a median 24% of the optical depth
+across the catalogue cases, mostly from the lowest few hundred metres.
 
-Coarse dust and sea salt are strongly forward-scattering and need hundreds of
-phase-function moments near backscatter. The constituent keeps every table
-moment (751), and the engine must keep them too. Truncating sea salt to 128
-moments gave radiance errors of tens of percent, or negative radiance, in
-testing. Delta-M scaling fixes
-the multiple-scatter part but not the single scatter, and the
-discrete-ordinates single-scatter source sees only `num_streams` moments.
-These settings were within 0.5% of a 64-stream reference. Set them before
-creating the `sk.Atmosphere`, which sizes its phase-function storage from the
-config:
+## Calculate radiance with aerosol
 
-```python
+This complete example creates an atmosphere, adds elevated tropical dust and
+typical tropical sulfate, and calculates a limb radiance at three wavelengths:
+
+```{code-cell}
 config = sk.Config()
 config.num_singlescatter_moments = 751
 config.delta_m_scaling = True
 config.multiple_scatter_source = sk.MultipleScatterSource.DiscreteOrdinates
 config.num_streams = 16
-# Keep the default config.single_scatter_source = sk.SingleScatterSource.Exact
 
-atmosphere = sk.Atmosphere(model_geometry, config, wavelengths_nm=wavelengths_nm)
-atmosphere["tropospheric_aerosol"] = aerosol.constituent(
-    "tropical_typical", month=7, ground_altitude_m=0.0
+model_geometry = sk.Geometry1D(
+    cos_sza=0.6,
+    solar_azimuth=0.,
+    earth_radius_m=6372000.,
+    altitude_grid_m=np.arange(0., 65001., 500.),
+    interpolation_method=sk.InterpolationMethod.LinearInterpolation,
+    geometry_type=sk.GeometryType.Spherical,
 )
+atmosphere = sk.Atmosphere(
+    model_geometry, config, wavelengths_nm=np.array([525., 756., 1021.])
+)
+sk.climatology.us76.add_us76_standard_atmosphere(atmosphere)
+atmosphere["rayleigh"] = sk.constituent.Rayleigh()
+atmosphere["dust"] = aerosol.constituent(
+    "tropical_elevated", aerosol_type="dust", month=7, ground_altitude_m=0.0
+)
+atmosphere["sulfate"] = aerosol.constituent(
+    "tropical_typical", aerosol_type="sulfate", month=7, ground_altitude_m=0.0
+)
+
+viewing_geometry = sk.ViewingGeometry()
+viewing_geometry.add_ray(sk.TangentAltitudeSolar(
+    tangent_altitude_m=5000.,
+    relative_azimuth=0.,
+    observer_altitude_m=200000.,
+    cos_sza=0.6,
+))
+engine = sk.Engine(config, model_geometry, viewing_geometry)
+result = engine.calculate_radiance(atmosphere)
+result.radiance
 ```
 
-The constituent is remapped onto the atmosphere's model altitudes when it is
-added, with the same AOD-conserving remap as `profile`, so its column AOD
-matches the catalogue on any model grid. Plain linear interpolation onto a
-coarse grid would not: on a 1 km grid it lost a median 24% of the AOD across
-the catalogue cases, mostly from the lowest few hundred metres. Pass
-`altitudes_m` to fix the grid yourself, for example to edit
-`extinction_per_m` before the calculation.
+Set these options before creating the `sk.Atmosphere`, which sizes its
+phase-function storage from the config. Coarse dust and sea salt are strongly
+forward-scattering and need hundreds of phase-function moments near
+backscatter. The constituent keeps every MERRA2 table moment (751), and the
+engine must keep them too: truncating sea salt to 128 moments gave radiance
+errors of tens of percent, or negative radiance, in testing. Delta-M scaling
+fixes the multiple-scatter part but not the single scatter, so keep the default
+exact single-scatter source; the discrete-ordinates single-scatter source sees
+only `num_streams` moments. These settings were within 0.5% of a 64-stream
+reference, and the constituent warns when the engine settings would
+misrepresent the aerosol.
 
-When combining this constituent with
-`sk.climatology.stratospheric_aerosol`, create the stratospheric profile with
-`lower_extension="zero"`. Its default exponential taper below the
-observations models stratospheric aerosol reaching into the troposphere,
-which the tropospheric case already contains.
-
-Pass `optics_root` to use a local copy of the optics tables. Passing
-`optical_property` replaces the MERRA2 optics with your own, normalized to
-the catalogue extinction at `wavelength_nm`; its spectral shape may then
-disagree with the catalogue's.
+The first use may download the catalogue and the MERRA2 aerosol optics tables.
+Pass `optics_root` to use a local copy of the tables. Passing `optical_property`
+replaces the MERRA2 optics with your own, normalized to the catalogue extinction
+at `wavelength_nm`; its spectral shape may then disagree with the catalogue's.
 
 ## Rebuilding the catalogue
 
 The compact runtime catalogue is built offline from MERRA2 products
 `M2I3NVAER`, `M2I3NVASM`, and `M2I1NXASM`, together with the five MERRA2 aerosol
-optical tables. By default the builder downloads each day's source granules
-from GES DISC to temporary storage and deletes them after processing; with
-`--no-stage-daily` it instead streams them using authenticated HTTP range
-reads. Create
-an Earthdata Login netrc entry. For a local run, install the optional build
-dependencies:
+optical tables. By default the builder reads 2016 through the last complete
+calendar year, so the scenarios represent the current aerosol climate; pass
+`--start-year` and `--end-year` to choose another period. It downloads each
+day's source granules from GES DISC to temporary storage and deletes them after
+processing; with `--no-stage-daily` it instead streams them using authenticated
+HTTP range reads. The selected columns are then always read with range
+requests. Create an Earthdata Login netrc entry. For a quick local run
+of one year, install the optional build dependencies:
 
 ```bash
 pip install -e ".[merra2-build]"

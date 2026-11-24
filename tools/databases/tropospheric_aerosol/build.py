@@ -57,6 +57,7 @@ _METADATA_UNITS = {
     "candidate_count": "1",
     "candidate_window_aod_min": "1",
     "candidate_window_aod_max": "1",
+    "column_total_aod_550nm": "1",
     "selected_latitude_degrees": "degrees_north",
     "selected_longitude_degrees": "degrees_east",
     "tropopause_altitude_m": "m",
@@ -73,9 +74,9 @@ _COMPONENTS = {
     "OCPHILIC": ("optics_OC.v1_3.nc", 1),
     "OCPHOBIC": ("optics_OC.v1_3.nc", 0),
 }
-# Aerosol types describing a column's composition: the share of its 550 nm
-# tropospheric AOD from each type. Profile selection prefers columns whose
-# shares are close to their loading window's median.
+# Aerosol types. Each type gets its own loading levels, from percentiles of
+# its own tropospheric 550 nm AOD, and its catalogue cases hold only its
+# species.
 _AEROSOL_TYPES = {
     "SU": ("SO4",),
     "DU": tuple(f"DU{i:03d}" for i in range(1, 6)),
@@ -90,6 +91,11 @@ _AEROSOL_TYPE_NAMES = {
     "BC": "black carbon",
     "OC": "organic carbon",
 }
+# Positions of each type's species in _COMPONENTS order.
+_TYPE_SPECIES_INDEX = {
+    aerosol_type: [list(_COMPONENTS).index(name) for name in species]
+    for aerosol_type, species in _AEROSOL_TYPES.items()
+}
 _AEROSOL_VARIABLES = [
     "AIRDENS",
     "DELP",
@@ -97,7 +103,18 @@ _AEROSOL_VARIABLES = [
     *_COMPONENTS,
 ]
 _METEOROLOGY_VARIABLES = ["H", "PL", "T", "PHIS"]
-_TARGET_ALTITUDES_M = np.arange(0.0, 20001.0, 250.0)
+# Catalogue grid: the whole MERRA2 column, whose 72 levels reach about 80 km
+# (model top 0.01 hPa). 250 m up to 20 km, which holds the troposphere, then
+# 1 km to 50 km and 2 km above; AOD above the top point folds into it.
+_TARGET_ALTITUDES_M = np.concatenate(
+    (
+        np.arange(0.0, 20000.0, 250.0),
+        np.arange(20000.0, 50000.0, 1000.0),
+        np.arange(50000.0, 84001.0, 2000.0),
+    )
+)
+# Tropospheric profiles kept for selection: the regular part of the grid.
+_SELECTION_ALTITUDES_M = _TARGET_ALTITUDES_M[_TARGET_ALTITUDES_M <= 20000.0]
 _WAVELENGTH_DECIMALS_NM = 2
 _REFERENCE_WAVELENGTH_NM = 550.0
 _GAS_CONSTANT_DRY_AIR = 287.05
@@ -108,7 +125,7 @@ _EGM2008_DATABASE_URL = (
     "https://arg.usask.ca/sasktranfiles/sasktran2_db/v_latest/"
     f"{_EGM2008_DATABASE_KEY}"
 )
-_CHECKPOINT_ALGORITHM_VERSION = 4
+_CHECKPOINT_ALGORITHM_VERSION = 5
 # GES DISC reprocessed these periods and publishes them only as stream 401.
 _STREAM_401_PERIODS = (
     (date(2020, 9, 1), date(2020, 9, 30)),
@@ -123,7 +140,8 @@ _OPTICS_FILES = tuple(sorted({filename for filename, _ in _COMPONENTS.values()})
 _RESERVOIR_ARRAY_FIELDS = (
     "keys",
     "aod",
-    "profiles",
+    "species_aod",
+    "type_profiles",
     "latitude",
     "longitude",
     "time",
@@ -132,7 +150,12 @@ _RESERVOIR_ARRAY_FIELDS = (
     "longitude_index",
     "tropopause_altitude",
     "surface_altitude",
-    "composition",
+)
+# Per-case profile arrays: kept in the catalogue, left out of the build report.
+_PROFILE_RECORD_KEYS = (
+    "extinction_per_m",
+    "species_extinction_550nm_per_m",
+    "relative_humidity",
 )
 
 
@@ -450,6 +473,40 @@ def calculate_type_extinction(
     )
 
 
+def calculate_species_extinction(
+    aerosol: xr.Dataset,
+    efficiency_profiles: dict[str, tuple[np.ndarray, np.ndarray]],
+    wavelengths_nm: np.ndarray,
+    wavelength_nm: float = 550.0,
+) -> np.ndarray:
+    """MERRA2 aerosol extinction at one wavelength in m-1, per species bin.
+
+    The leading axis follows ``_COMPONENTS`` and sums to
+    :func:`calculate_extinction`. A species missing from
+    ``efficiency_profiles`` is zero.
+    """
+    parts = [
+        (
+            calculate_extinction(
+                aerosol,
+                {species: efficiency_profiles[species]},
+                wavelengths_nm,
+                wavelength_nm,
+            )
+            if species in efficiency_profiles
+            else None
+        )
+        for species in _COMPONENTS
+    ]
+    present = [part for part in parts if part is not None]
+    if not present:
+        msg = "No MERRA2 aerosol species with efficiencies to calculate extinction"
+        raise ValueError(msg)
+    return np.stack(
+        [np.zeros_like(present[0]) if part is None else part for part in parts]
+    )
+
+
 def calculate_species_spectral_extinction(
     aerosol: xr.Dataset,
     efficiency_profiles: dict[str, tuple[np.ndarray, np.ndarray]],
@@ -596,9 +653,8 @@ def _open_granule(location: Path | str, identity_callback=None):
                                 and exc.status == 403
                             )
                             if (
-                                (not retryable(exc) and not expired_redirect)
-                                or attempt == 4
-                            ):
+                                not retryable(exc) and not expired_redirect
+                            ) or attempt == 4:
                                 raise
                             if expired_redirect:
                                 try:
@@ -892,10 +948,7 @@ def _open_daily_granules(
             yield identities, aerosol, meteorology, tropopause
     else:
         callbacks = (
-            {
-                product: partial(identities.__setitem__, product)
-                for product in _PRODUCTS
-            }
+            {product: partial(identities.__setitem__, product) for product in _PRODUCTS}
             if checkpointing
             else {}
         )
@@ -1132,9 +1185,16 @@ def _input_access_description(data_root: Path | None, stage_daily: bool) -> str:
     if stage_daily:
         return (
             "GES DISC authenticated HTTP; full daily granules staged to local "
-            "temporary storage and deleted after processing"
+            "temporary storage and deleted after processing; selected columns "
+            "read with HTTP range requests"
         )
     return "GES DISC authenticated HTTP range streaming; no full granule downloads"
+
+
+def _trapezoid_weights(grid: np.ndarray) -> np.ndarray:
+    """Width of each grid point's trapezoid cell."""
+    bounds = np.concatenate(([grid[0]], 0.5 * (grid[1:] + grid[:-1]), [grid[-1]]))
+    return np.diff(bounds)
 
 
 def _conservative_grid_profile(
@@ -1144,8 +1204,9 @@ def _conservative_grid_profile(
     tropospheric_fraction: np.ndarray,
     surface_altitude_m: float,
     tropopause_altitude_m: float,
+    grid: np.ndarray = _TARGET_ALTITUDES_M,
 ) -> np.ndarray:
-    """Map layer extinction (levels, ...) to _TARGET_ALTITUDES_M conserving AOD.
+    """Map layer extinction (levels, ...) to ``grid`` conserving AOD.
 
     Each layer's AOD (extinction * hydrostatic thickness) is spread uniformly
     between the midpoints of its neighbours' heights, starting at the surface,
@@ -1157,6 +1218,8 @@ def _conservative_grid_profile(
     below the tropopause fold into the nearest valid point (the runtime zeroes
     those points). Dividing by the trapezoid weights makes the trapezoid
     integral on the grid equal sum(extinction * thickness * fraction).
+    With an infinite ``tropopause_altitude_m`` the whole column counts, and
+    AOD above the top grid point folds into it. ``grid`` may be irregular.
     """
     order = np.argsort(height_m)
     height = height_m[order]
@@ -1174,27 +1237,31 @@ def _conservative_grid_profile(
         )
     )
     cumulative = np.vstack((np.zeros(layer_aod.shape[1]), np.cumsum(layer_aod, axis=0)))
-    grid = _TARGET_ALTITUDES_M
-    spacing = grid[1] - grid[0]
-    bounds = np.concatenate(([-np.inf], grid[:-1] + 0.5 * spacing, [np.inf]))
+    bounds = np.concatenate(([-np.inf], 0.5 * (grid[1:] + grid[:-1]), [np.inf]))
     cut = np.minimum(bounds, tropopause_altitude_m)
     cell_aod = np.diff(
         np.column_stack([np.interp(cut, edges, column) for column in cumulative.T]),
         axis=0,
     )
-    valid = _valid_grid_points(surface_altitude_m, tropopause_altitude_m)
+    valid = _valid_grid_points(surface_altitude_m, tropopause_altitude_m, grid)
     if not valid.any():
         return np.full((len(grid), *extinction.shape[1:]), np.nan)
     first, last = np.flatnonzero(valid)[[0, -1]]
     cell_aod[first] += cell_aod[:first].sum(axis=0)
     cell_aod[last] += cell_aod[last + 1 :].sum(axis=0)
     cell_aod[~valid] = 0.0
-    weights = np.full(len(grid), spacing)
-    weights[[0, -1]] = 0.5 * spacing
+    weights = _trapezoid_weights(grid)
     return (cell_aod / weights[:, None]).reshape(len(grid), *extinction.shape[1:])
 
 
 class _WeightedReservoir:
+    """Area-weighted sample of one latitude band's valid columns in one month.
+
+    Keys depend only on cos(latitude) and a random draw, not on AOD, so one
+    sample represents every aerosol type: each type's loading windows come
+    from the same columns.
+    """
+
     def __init__(self, capacity: int, rng: np.random.Generator):
         if capacity < 1000:
             msg = "reservoir_size must be at least 1000 for the P99 loading tier"
@@ -1203,7 +1270,10 @@ class _WeightedReservoir:
         self.rng = rng
         self.keys = np.empty(0)
         self.aod = np.empty(0)
-        self.profiles = np.empty((0, len(_TARGET_ALTITUDES_M)))
+        self.species_aod = np.empty((0, len(_COMPONENTS)))
+        self.type_profiles = np.empty(
+            (0, len(_AEROSOL_TYPES), len(_SELECTION_ALTITUDES_M)), dtype=np.float32
+        )
         self.latitude = np.empty(0)
         self.longitude = np.empty(0)
         self.time = np.empty(0, dtype="datetime64[ns]")
@@ -1212,12 +1282,22 @@ class _WeightedReservoir:
         self.longitude_index = np.empty(0, dtype=np.int16)
         self.tropopause_altitude = np.empty(0)
         self.surface_altitude = np.empty(0)
-        self.composition = np.empty((0, len(_AEROSOL_TYPES)))
         self.valid_candidates = 0
+
+    @property
+    def type_aod(self) -> np.ndarray:
+        """Tropospheric 550 nm AOD per aerosol type, (columns, _AEROSOL_TYPES)."""
+        return np.stack(
+            [
+                self.species_aod[:, indices].sum(axis=1)
+                for indices in _TYPE_SPECIES_INDEX.values()
+            ],
+            axis=1,
+        )
 
     def add(
         self,
-        type_extinction: np.ndarray,
+        species_extinction: np.ndarray,
         height_m: np.ndarray,
         pressure_pa: np.ndarray,
         layer_thickness_m: np.ndarray,
@@ -1231,16 +1311,21 @@ class _WeightedReservoir:
     ) -> None:
         """Offer one timestamp's columns to the reservoir.
 
-        ``type_extinction`` is 550 nm extinction split by aerosol type, with a
-        leading ``_AEROSOL_TYPES`` axis before (level, latitude, longitude).
+        ``species_extinction`` is 550 nm extinction per species bin, with a
+        leading ``_COMPONENTS`` axis before (level, latitude, longitude).
+        A column is valid when its total tropospheric AOD is positive; each
+        accepted column keeps its per-species AOD and per-type tropospheric
+        profiles on the catalogue grid.
         """
-        if type_extinction.ndim != 4 or type_extinction.shape[0] != len(_AEROSOL_TYPES):
+        if species_extinction.ndim != 4 or species_extinction.shape[0] != len(
+            _COMPONENTS
+        ):
             msg = (
-                "type_extinction must have a leading axis of "
-                f"{len(_AEROSOL_TYPES)} aerosol types before (level, lat, lon)"
+                "species_extinction must have a leading axis of "
+                f"{len(_COMPONENTS)} species before (level, lat, lon)"
             )
             raise ValueError(msg)
-        extinction = type_extinction.sum(axis=0)
+        extinction = species_extinction.sum(axis=0)
         tropospheric_fraction, tropopause_altitude = _tropospheric_fraction(
             height_m, pressure_pa, tropopause_pressure_pa, surface_altitude_m
         )
@@ -1258,23 +1343,16 @@ class _WeightedReservoir:
             & np.isfinite(tropopause_altitude)
             & np.all(~in_troposphere | valid_levels, axis=0)
         )
+        # Each level's contribution to tropospheric AOD per unit extinction.
+        level_weight = np.where(
+            in_troposphere & valid_levels,
+            layer_thickness_m * tropospheric_fraction,
+            0.0,
+        )
         column_aod = np.sum(
-            np.where(
-                in_troposphere & valid_levels,
-                extinction * layer_thickness_m * tropospheric_fraction,
-                0.0,
-            ),
-            axis=0,
+            np.where(level_weight > 0, extinction * level_weight, 0.0), axis=0
         )
         valid_columns &= np.isfinite(column_aod) & (column_aod > 0)
-        type_aod = np.sum(
-            np.where(
-                (in_troposphere & valid_levels)[None],
-                type_extinction * (layer_thickness_m * tropospheric_fraction)[None],
-                0.0,
-            ),
-            axis=1,
-        ).reshape(len(_AEROSOL_TYPES), -1)
         flat = np.flatnonzero(valid_columns)
         if flat.size == 0:
             return
@@ -1297,67 +1375,73 @@ class _WeightedReservoir:
             self.valid_candidates += flat.size
             return
         new_keys = keys[accepted]
-        new_flat = flat[accepted]
-        new_profiles = np.empty((len(accepted), len(_TARGET_ALTITUDES_M)))
+        accepted_flat = flat[accepted]
+        accepted_lat_index, accepted_lon_index = np.divmod(accepted_flat, nlon)
+        column_species = species_extinction[
+            :, :, accepted_lat_index, accepted_lon_index
+        ]  # (species, level, accepted)
+        new_species_aod = np.einsum(
+            "slk,lk->ks",
+            np.where(
+                level_weight[None, :, accepted_lat_index, accepted_lon_index] > 0,
+                column_species,
+                0.0,
+            ),
+            level_weight[:, accepted_lat_index, accepted_lon_index],
+        )
+        column_types = np.stack(
+            [
+                column_species[indices].sum(axis=0)
+                for indices in _TYPE_SPECIES_INDEX.values()
+            ]
+        )  # (type, level, accepted)
+        new_type_profiles = np.empty(
+            (len(accepted), len(_AEROSOL_TYPES), len(_SELECTION_ALTITUDES_M))
+        )
         new_tropopause_altitude = np.empty(len(accepted))
-        for index, flat_index in enumerate(new_flat):
+        for index, (ilat, ilon) in enumerate(
+            zip(accepted_lat_index, accepted_lon_index, strict=True)
+        ):
             # valid_columns guarantees finite, monotonic heights and pressures.
-            ilat, ilon = divmod(int(flat_index), nlon)
             new_tropopause_altitude[index] = tropopause_altitude[ilat, ilon]
-            new_profiles[index] = _conservative_grid_profile(
-                extinction[:, ilat, ilon],
+            new_type_profiles[index] = _conservative_grid_profile(
+                column_types[:, :, index].T,
                 height_m[:, ilat, ilon],
                 layer_thickness_m[:, ilat, ilon],
                 tropospheric_fraction[:, ilat, ilon],
                 surface_altitude_m[ilat, ilon],
                 new_tropopause_altitude[index],
-            )
+                _SELECTION_ALTITUDES_M,
+            ).T
 
-        accepted_flat = flat[accepted]
-        accepted_lat_index, accepted_lon_index = np.divmod(accepted_flat, nlon)
-        keep = np.isfinite(new_profiles).all(axis=1) & np.isfinite(
-            new_tropopause_altitude
+        keep = (
+            np.isfinite(new_type_profiles).all(axis=(1, 2))
+            & np.isfinite(new_tropopause_altitude)
+            & np.isfinite(new_species_aod).all(axis=1)
         )
         new_keys = new_keys[keep]
         new_flat = accepted_flat[keep]
-        new_profiles = new_profiles[keep]
-        new_tropopause_altitude = new_tropopause_altitude[keep]
         accepted_lat_index = accepted_lat_index[keep]
         accepted_lon_index = accepted_lon_index[keep]
         new_fields = {
             "aod": column_aod.ravel()[new_flat],
-            "profiles": new_profiles,
+            "species_aod": new_species_aod[keep],
+            "type_profiles": new_type_profiles[keep].astype(np.float32),
             "latitude": latitude[accepted_lat_index],
             "longitude": longitude[accepted_lon_index],
             "time": np.full(len(new_keys), time, dtype="datetime64[ns]"),
             "time_index": np.full(len(new_keys), time_index, dtype=np.int16),
             "latitude_index": latitude_indices[accepted_lat_index].astype(np.int16),
             "longitude_index": accepted_lon_index.astype(np.int16),
-            "tropopause_altitude": new_tropopause_altitude,
+            "tropopause_altitude": new_tropopause_altitude[keep],
             "surface_altitude": surface_altitude_m[
                 accepted_lat_index, accepted_lon_index
             ],
-            "composition": (
-                type_aod[:, new_flat] / column_aod.ravel()[new_flat][None, :]
-            ).T,
-        }
-        old_fields = {
-            "aod": self.aod,
-            "profiles": self.profiles,
-            "latitude": self.latitude,
-            "longitude": self.longitude,
-            "time": self.time,
-            "time_index": self.time_index,
-            "latitude_index": self.latitude_index,
-            "longitude_index": self.longitude_index,
-            "tropopause_altitude": self.tropopause_altitude,
-            "surface_altitude": self.surface_altitude,
-            "composition": self.composition,
         }
         combined_keys = np.concatenate((self.keys, new_keys))
         combined_fields = {
-            name: np.concatenate((old_fields[name], new_fields[name]), axis=0)
-            for name in old_fields
+            name: np.concatenate((getattr(self, name), values), axis=0)
+            for name, values in new_fields.items()
         }
         keep_count = min(self.capacity, len(combined_keys))
         selected = (
@@ -1371,81 +1455,117 @@ class _WeightedReservoir:
         self.valid_candidates += flat.size
 
     def _window(
-        self, quantile: float, half_width: float
+        self, quantile: float, half_width: float, aerosol_type: str
     ) -> tuple[np.ndarray, float, float]:
-        """Indices of sampled columns in a percentile window, and its AOD bounds."""
+        """Sampled columns in a percentile window of one type's AOD, and its bounds."""
         if self.aod.size < 1000:
             msg = (
                 "At least 1000 valid MERRA2 columns are required per "
                 "latitude-band/month"
             )
             raise ValueError(msg)
+        values = self.type_aod[:, list(_AEROSOL_TYPES).index(aerosol_type)]
         lower, upper = np.quantile(
-            self.aod,
+            values,
             [max(0.0, quantile - half_width), min(1.0, quantile + half_width)],
         )
-        group = np.flatnonzero((self.aod >= lower) & (self.aod <= upper))
+        group = np.flatnonzero((values >= lower) & (values <= upper))
         if group.size < 5:
             msg = (
-                f"Only {group.size} sampled columns in percentile window "
-                f"{quantile - half_width:.3f}-{quantile + half_width:.3f}"
+                f"Only {group.size} sampled columns in the {aerosol_type} percentile "
+                f"window {quantile - half_width:.3f}-{quantile + half_width:.3f}"
             )
             raise ValueError(msg)
         return group, float(lower), float(upper)
 
-    def _median_composition(self, group: np.ndarray) -> np.ndarray:
-        median = np.median(self.composition[group], axis=0)
+    def species_mix(self, indices: np.ndarray, aerosol_type: str) -> np.ndarray:
+        """Each species' share of the type's AOD, (columns, _COMPONENTS).
+
+        Species outside the type are zero; so are columns without that type.
+        """
+        type_aod = self.type_aod[indices, list(_AEROSOL_TYPES).index(aerosol_type)]
+        species = _TYPE_SPECIES_INDEX[aerosol_type]
+        mix = np.zeros((len(indices), len(_COMPONENTS)))
+        mix[:, species] = np.divide(
+            self.species_aod[np.ix_(indices, species)],
+            type_aod[:, None],
+            out=np.zeros((len(indices), len(species))),
+            where=type_aod[:, None] > 0,
+        )
+        return mix
+
+    def _median_species_mix(self, group: np.ndarray, aerosol_type: str) -> np.ndarray:
+        median = np.median(self.species_mix(group, aerosol_type), axis=0)
         total = median.sum()
         return median / total if total > 0 else median
 
-    def median_composition(self, quantile: float, half_width: float) -> np.ndarray:
-        """The window's median AOD share per aerosol type, renormalized to sum to 1."""
-        group, _, _ = self._window(quantile, half_width)
-        return self._median_composition(group)
+    def median_species_mix(
+        self, quantile: float, half_width: float, aerosol_type: str
+    ) -> np.ndarray:
+        """The window's median species shares of the type, renormalized to sum to 1."""
+        group = self._candidates(quantile, half_width, aerosol_type)[0]
+        return self._median_species_mix(group, aerosol_type)
+
+    def _candidates(
+        self, quantile: float, half_width: float, aerosol_type: str
+    ) -> tuple[np.ndarray, int, float, float]:
+        """Window members with some of the type, the window size, and its bounds."""
+        window, lower, upper = self._window(quantile, half_width, aerosol_type)
+        type_aod = self.type_aod[window, list(_AEROSOL_TYPES).index(aerosol_type)]
+        group = window[type_aod > 0]
+        if group.size == 0:
+            msg = (
+                f"No sampled column in the {aerosol_type} percentile window "
+                f"{quantile - half_width:.3f}-{quantile + half_width:.3f} has "
+                f"positive {aerosol_type} AOD"
+            )
+            raise ValueError(msg)
+        return group, window.size, lower, upper
 
     def select_tier(
-        self, quantile: float, half_width: float
+        self, quantile: float, half_width: float, aerosol_type: str
     ) -> tuple[int, float, int, float, float]:
-        """Choose the window's most representative column.
+        """Choose the most representative column of one type's loading window.
 
-        Each candidate is scored by two distances from the window's medians,
-        each divided by its own median over the window so the two count
-        equally: vertical profile shape and aerosol-type composition.
+        The window spans percentiles of the type's tropospheric AOD. Each
+        candidate is scored by two distances from the window's medians, each
+        divided by its own median over the window so the two count equally:
+        the shape of the type's profile, and the mix of the type's species
+        (size bins, or hydrophilic and hydrophobic carbon). Sulfate has one
+        species, so only its shape counts.
         """
-        group, lower, upper = self._window(quantile, half_width)
+        group, window_size, lower, upper = self._candidates(
+            quantile, half_width, aerosol_type
+        )
+        type_index = list(_AEROSOL_TYPES).index(aerosol_type)
+        all_type_aod = self.type_aod[:, type_index]
         # Compare profile shapes, each normalized by its own AOD. Scoring the
         # profiles themselves favoured the lowest-loading members: deviations
         # in log1p(extinction / scale) shrink with extinction, so 42 of 48
         # selections in the 2024 catalogue fell below the window centre.
-        group_aod = self.aod[group]
-        group_shapes = np.divide(
-            self.profiles[group],
-            group_aod[:, None],
-            out=np.zeros_like(self.profiles[group]),
-            where=group_aod[:, None] > 0,
+        group_shapes = (
+            self.type_profiles[group, type_index].astype(float)
+            / all_type_aod[group][:, None]
         )
         positive = group_shapes[group_shapes > 0]
         if positive.size == 0:
-            msg = "Loading tier candidate group has no positive extinction"
+            msg = f"{aerosol_type} loading tier candidate group has no positive extinction"
             raise ValueError(msg)
         scale = float(np.median(positive))
         transformed = np.log1p(group_shapes / scale)
         median_profile = np.median(transformed, axis=0)
         shape_score = np.mean((transformed - median_profile) ** 2, axis=1)
-        # Composition: squared differences of square-rooted AOD shares, so minor
-        # types such as black carbon still count against the major ones.
-        target = self._median_composition(group)
-        composition_score = np.sum(
-            (np.sqrt(np.clip(self.composition[group], 0.0, None)) - np.sqrt(target))
-            ** 2,
+        # Species mix: squared differences of square-rooted AOD shares, so
+        # minor species such as the largest dust bin still count.
+        target = self._median_species_mix(group, aerosol_type)
+        mix_score = np.sum(
+            (np.sqrt(self.species_mix(group, aerosol_type)) - np.sqrt(target)) ** 2,
             axis=1,
         )
-        score = _relative_to_median(shape_score) + _relative_to_median(
-            composition_score
-        )
+        score = _relative_to_median(shape_score) + _relative_to_median(mix_score)
         selected_index = int(group[np.argmin(score)])
-        percentile = float(100 * np.mean(self.aod <= self.aod[selected_index]))
-        estimated_count = round(group.size / self.aod.size * self.valid_candidates)
+        percentile = float(100 * np.mean(all_type_aod <= all_type_aod[selected_index]))
+        estimated_count = round(window_size / self.aod.size * self.valid_candidates)
         return (
             selected_index,
             percentile,
@@ -1479,21 +1599,22 @@ def _source_locations(day: date, data_root: Path | None) -> dict[str, Path | str
 
 
 class _ColumnProfiles(NamedTuple):
-    """One selected column on _TARGET_ALTITUDES_M.
+    """One selected column over the whole of _TARGET_ALTITUDES_M.
 
-    Shapes: extinction (altitude, wavelength); species extinction (altitude,
-    species in _COMPONENTS order); relative humidity (altitude,).
+    Profiles hold the whole MERRA2 column from the surface, including aerosol
+    above the tropopause. Shapes: species extinction (altitude, species in
+    _COMPONENTS order, wavelength); relative humidity (altitude,).
     """
 
-    extinction_per_m: np.ndarray
-    species_extinction_550nm_per_m: np.ndarray
+    species_extinction_per_m: np.ndarray
     relative_humidity: np.ndarray
 
 
 def _valid_grid_points(
-    surface_altitude_m: float, tropopause_altitude_m: float
+    surface_altitude_m: float,
+    tropopause_altitude_m: float,
+    grid: np.ndarray = _TARGET_ALTITUDES_M,
 ) -> np.ndarray:
-    grid = _TARGET_ALTITUDES_M
     return (grid >= surface_altitude_m) & (grid <= tropopause_altitude_m)
 
 
@@ -1503,7 +1624,7 @@ def _grid_humidity(
     surface_altitude_m: float,
     tropopause_altitude_m: float,
 ) -> np.ndarray:
-    """RH (clipped 0-0.99) at grid points; outside the troposphere, nearest valid."""
+    """RH (clipped 0-0.99) at grid points; outside the valid range, nearest valid."""
     order = np.argsort(height_m)
     humidity = np.interp(
         _TARGET_ALTITUDES_M,
@@ -1532,9 +1653,9 @@ def _read_column_spectra(
 ) -> list[_ColumnProfiles]:
     """Read ``(time, latitude, longitude)`` index columns from one day.
 
-    The day's granules are opened once, the same way as in the daily pass:
-    remote granules are downloaded first when ``stage_daily`` is set and
-    streamed with range requests otherwise.
+    The day's granules are opened once: remote granules are downloaded first
+    when ``stage_daily`` is set and streamed with range requests otherwise.
+    _process_month reads selected columns with ``stage_daily=False``.
     """
     with _open_daily_granules(
         day,
@@ -1623,34 +1744,29 @@ def _column_spectrum(
         * aerosol_column.DELP.values.astype(float)
         / pressure
     )
-    tropospheric_fraction, tropopause_height = _tropospheric_fraction(
+    _, tropopause_height = _tropospheric_fraction(
         height, pressure, tropopause_pressure, surface_height
     )
-    tropopause_height = float(tropopause_height)
-    if not np.isfinite(tropopause_height):
+    if not np.isfinite(float(tropopause_height)):
         msg = "MERRA2 column pressure and height must be finite and monotonic"
         raise ValueError(msg)
-
-    def on_grid(values: np.ndarray) -> np.ndarray:
-        return _conservative_grid_profile(
-            values,
+    # The whole column: every layer counts, with no cut at the tropopause
+    # (the runtime cuts there by default). The grid reaches above the MERRA2
+    # model top, and any AOD above its top point folds into it.
+    return _ColumnProfiles(
+        species_extinction_per_m=_conservative_grid_profile(
+            species_extinction,
             height,
             layer_thickness,
-            tropospheric_fraction,
+            np.ones_like(height),
             surface_height,
-            tropopause_height,
-        )
-
-    return _ColumnProfiles(
-        extinction_per_m=on_grid(species_extinction.sum(axis=1)),
-        species_extinction_550nm_per_m=on_grid(
-            species_extinction[:, :, _reference_wavelength_index(wavelengths_nm)]
+            np.inf,
         ),
         relative_humidity=_grid_humidity(
             aerosol_column.RH.values.astype(float),
             height,
             surface_height,
-            tropopause_height,
+            np.inf,
         ),
     )
 
@@ -1694,8 +1810,11 @@ def _save_month_checkpoint(
     temporary_path = None
     try:
         with tempfile.NamedTemporaryFile(
-            mode="wb", dir=path.parent, prefix=f".{path.name}.", suffix=".tmp",
-            delete=False
+            mode="wb",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
         ) as temporary_file:
             temporary_path = Path(temporary_file.name)
             np.savez_compressed(temporary_file, **arrays)
@@ -1799,10 +1918,9 @@ def _load_month_checkpoint(
                 sample_count = len(fields["keys"])
                 if (
                     sample_count > reservoir.capacity
-                    or fields["profiles"].shape
-                    != (sample_count, len(_TARGET_ALTITUDES_M))
-                    or fields["composition"].shape
-                    != (sample_count, len(_AEROSOL_TYPES))
+                    or fields["type_profiles"].shape
+                    != (sample_count, len(_AEROSOL_TYPES), len(_SELECTION_ALTITUDES_M))
+                    or fields["species_aod"].shape != (sample_count, len(_COMPONENTS))
                     or any(len(values) != sample_count for values in fields.values())
                 ):
                     msg = f"Invalid reservoir arrays in checkpoint: {path}"
@@ -1957,7 +2075,7 @@ def _process_month(
                         ):
                             msg = "MERRA2 source latitude/longitude grids do not match"
                             raise ValueError(msg)
-                        type_extinction = calculate_type_extinction(
+                        species_extinction = calculate_species_extinction(
                             aer_part, efficiency_profiles, wavelengths_nm
                         )
                         model_pressure = met_part.PL.values.astype(float)
@@ -1991,7 +2109,7 @@ def _process_month(
                                 / model_pressure
                             )
                         reservoirs[band].add(
-                            type_extinction,
+                            species_extinction,
                             model_height,
                             model_pressure,
                             layer_thickness,
@@ -2045,74 +2163,101 @@ def _process_month(
             reservoir.aod.size,
             reservoir.valid_candidates,
         )
-        for loading, (quantile, half_width) in _TIERS.items():
-            index, percentile, count, lower, upper = reservoir.select_tier(
-                quantile, half_width
-            )
-            timestamp = np.datetime_as_string(reservoir.time[index], unit="s")
-            selections.append(
-                (band, loading, index, percentile, count, lower, upper, timestamp)
-            )
-
-    # Read the selected columns one day at a time, so a day chosen for several
-    # scenarios is opened (and downloaded) once.
-    selected_days = sorted({date.fromisoformat(item[-1][:10]) for item in selections})
-    column_stager = (
-        _DayStager(selected_days, checkpointing=False)
-        if stage_daily and data_root is None
-        else None
-    )
-    columns = {}
-    try:
-        for day in selected_days:
-            day_selections = [
-                item for item in selections if item[-1][:10] == day.isoformat()
-            ]
-            logging.info(
-                "Reading %d selected MERRA2 column(s) for month %02d from %s",
-                len(day_selections),
-                month,
-                day.isoformat(),
-            )
-            day_columns = _read_column_spectra(
-                day,
-                [
-                    (
-                        int(reservoirs[band].time_index[index]),
-                        int(reservoirs[band].latitude_index[index]),
-                        int(reservoirs[band].longitude_index[index]),
+        for aerosol_type in _AEROSOL_TYPES:
+            for loading, (quantile, half_width) in _TIERS.items():
+                try:
+                    index, percentile, count, lower, upper = reservoir.select_tier(
+                        quantile, half_width, aerosol_type
                     )
-                    for band, _, index, *_ in day_selections
-                ],
-                data_root,
-                geoid_undulation,
-                efficiency_profiles,
-                wavelengths_nm,
-                stage_daily=stage_daily,
-                stager=column_stager,
-            )
-            for (band, loading, *_), column in zip(
-                day_selections, day_columns, strict=True
-            ):
-                columns[band, loading] = column
-    finally:
-        if column_stager is not None:
-            column_stager.close()
+                except ValueError as exc:
+                    msg = f"Month {month:02d} {band} {aerosol_type} {loading}: {exc}"
+                    raise ValueError(msg) from exc
+                timestamp = np.datetime_as_string(reservoir.time[index], unit="s")
+                selections.append(
+                    (
+                        band,
+                        aerosol_type,
+                        loading,
+                        index,
+                        percentile,
+                        count,
+                        lower,
+                        upper,
+                        timestamp,
+                    )
+                )
 
-    result = []
-    for band, loading, index, percentile, count, lower, upper, timestamp in selections:
+    # Each selected column is read once, even when it was chosen for several
+    # types or loadings, and each day's granules are opened once. Remote
+    # columns are read with HTTP range requests whatever stage_daily says:
+    # staging would download about 6.6 GB of whole granules per column.
+    def source_column(band: str, index: int) -> tuple[int, int, int]:
         reservoir = reservoirs[band]
-        column = columns[band, loading]
+        return (
+            int(reservoir.time_index[index]),
+            int(reservoir.latitude_index[index]),
+            int(reservoir.longitude_index[index]),
+        )
+
+    columns_by_day: dict[str, set[tuple[int, int, int]]] = {}
+    for band, _, _, index, *_, timestamp in selections:
+        columns_by_day.setdefault(timestamp[:10], set()).add(source_column(band, index))
+    columns = {}
+    for day_text in sorted(columns_by_day):
+        day_columns = sorted(columns_by_day[day_text])
+        logging.info(
+            "Reading %d selected MERRA2 column(s) for month %02d from %s%s",
+            len(day_columns),
+            month,
+            day_text,
+            "" if data_root is not None else " with HTTP range requests",
+        )
+        profiles = _read_column_spectra(
+            date.fromisoformat(day_text),
+            day_columns,
+            data_root,
+            geoid_undulation,
+            efficiency_profiles,
+            wavelengths_nm,
+            stage_daily=False,
+        )
+        columns.update(zip(day_columns, profiles, strict=True))
+
+    reference_index = _reference_wavelength_index(wavelengths_nm)
+    result = []
+    for (
+        band,
+        aerosol_type,
+        loading,
+        index,
+        percentile,
+        count,
+        lower,
+        upper,
+        timestamp,
+    ) in selections:
+        reservoir = reservoirs[band]
+        column = columns[source_column(band, index)]
+        species = _TYPE_SPECIES_INDEX[aerosol_type]
+        type_species = column.species_extinction_per_m[:, species, :]
+        species_550nm = np.zeros(column.species_extinction_per_m.shape[:2])
+        species_550nm[:, species] = type_species[:, :, reference_index]
         result.append(
             {
                 "scenario": f"{band}_{loading}",
+                "aerosol_type": aerosol_type,
                 "month": month,
-                **column._asdict(),
-                "selection_aod_550nm": float(reservoir.aod[index]),
+                "extinction_per_m": type_species.sum(axis=1),
+                "species_extinction_550nm_per_m": species_550nm,
+                "relative_humidity": column.relative_humidity,
+                "selection_aod_550nm": float(
+                    reservoir.type_aod[index, list(_AEROSOL_TYPES).index(aerosol_type)]
+                ),
                 "selection_percentile": percentile,
                 "candidate_count": count,
                 "candidate_window_aod_min": lower,
                 "candidate_window_aod_max": upper,
+                "column_total_aod_550nm": float(reservoir.aod[index]),
                 "selected_latitude_degrees": float(reservoir.latitude[index]),
                 "selected_longitude_degrees": float(reservoir.longitude[index]),
                 "selected_time": timestamp,
@@ -2120,9 +2265,11 @@ def _process_month(
                 "surface_altitude_m": float(reservoir.surface_altitude[index]),
                 "sampled_candidate_count": int(reservoir.aod.size),
                 "valid_candidate_count": int(reservoir.valid_candidates),
-                "selection_type_aod_fraction": reservoir.composition[index].tolist(),
-                "candidate_median_type_aod_fraction": reservoir.median_composition(
-                    *_TIERS[loading]
+                "selection_species_aod_fraction": reservoir.species_mix(
+                    np.array([index]), aerosol_type
+                )[0].tolist(),
+                "candidate_median_species_aod_fraction": reservoir.median_species_mix(
+                    *_TIERS[loading], aerosol_type
                 ).tolist(),
             }
         )
@@ -2242,34 +2389,39 @@ def build_catalogue(
         month_records = [records_by_month[month] for month in _MONTHS]
     records = [record for group in month_records for record in group]
     scenarios = [f"{band}_{loading}" for band in _BANDS for loading in _TIERS]
+    aerosol_types = list(_AEROSOL_TYPES)
     months = list(_MONTHS)
-    expected_cases = {(scenario, month) for scenario in scenarios for month in months}
-    actual_cases = {(record["scenario"], record["month"]) for record in records}
+    expected_cases = {
+        (scenario, aerosol_type, month)
+        for scenario in scenarios
+        for aerosol_type in aerosol_types
+        for month in months
+    }
+    actual_cases = {
+        (record["scenario"], record["aerosol_type"], record["month"])
+        for record in records
+    }
     if len(records) != len(expected_cases) or actual_cases != expected_cases:
         msg = (
             "Catalogue generation must produce exactly one profile for every "
-            "scenario/month pair before writing output"
+            "scenario/aerosol-type/month case before writing output"
         )
         raise ValueError(msg)
     altitude_size = len(_TARGET_ALTITUDES_M)
+    case_shape = (len(scenarios), len(aerosol_types), len(months))
     extinction = np.zeros(
-        (len(scenarios), len(months), altitude_size, len(wavelengths_nm)),
-        dtype=np.float32,
+        (*case_shape, altitude_size, len(wavelengths_nm)), dtype=np.float32
     )
     species_extinction = np.zeros(
-        (len(scenarios), len(months), len(_COMPONENTS), altitude_size),
-        dtype=np.float32,
+        (*case_shape, len(_COMPONENTS), altitude_size), dtype=np.float32
     )
-    relative_humidity = np.zeros(
-        (len(scenarios), len(months), altitude_size), dtype=np.float32
+    relative_humidity = np.zeros((*case_shape, altitude_size), dtype=np.float32)
+    mix_names = (
+        "selection_species_aod_fraction",
+        "candidate_median_species_aod_fraction",
     )
-    composition_names = (
-        "selection_type_aod_fraction",
-        "candidate_median_type_aod_fraction",
-    )
-    compositions = {
-        name: np.full((len(scenarios), len(months), len(_AEROSOL_TYPES)), np.nan)
-        for name in composition_names
+    mixes = {
+        name: np.full((*case_shape, len(_COMPONENTS)), np.nan) for name in mix_names
     }
     reference_index = _reference_wavelength_index(wavelengths_nm)
     metadata_names = [
@@ -2278,6 +2430,7 @@ def build_catalogue(
         "candidate_count",
         "candidate_window_aod_min",
         "candidate_window_aod_max",
+        "column_total_aod_550nm",
         "selected_latitude_degrees",
         "selected_longitude_degrees",
         "selected_time",
@@ -2286,13 +2439,14 @@ def build_catalogue(
         "sampled_candidate_count",
         "valid_candidate_count",
     ]
-    metadata = {
-        name: np.empty((len(scenarios), len(months)), dtype=object)
-        for name in metadata_names
-    }
+    metadata = {name: np.empty(case_shape, dtype=object) for name in metadata_names}
     for record in records:
-        scenario_index = scenarios.index(record["scenario"])
-        month_index = months.index(record["month"])
+        case = (
+            scenarios.index(record["scenario"]),
+            aerosol_types.index(record["aerosol_type"]),
+            months.index(record["month"]),
+        )
+        label = f"{record['scenario']} {record['aerosol_type']} month {record['month']}"
         species = np.asarray(record["species_extinction_550nm_per_m"])
         if not np.allclose(
             species.sum(axis=1),
@@ -2300,20 +2454,22 @@ def build_catalogue(
             rtol=1e-6,
             atol=0,
         ):
-            msg = (
-                f"{record['scenario']} month {record['month']}: species extinction "
-                "does not sum to the total 550 nm extinction"
-            )
+            msg = f"{label}: species extinction does not sum to the total 550 nm extinction"
             raise ValueError(msg)
-        extinction[scenario_index, month_index] = record["extinction_per_m"]
-        species_extinction[scenario_index, month_index] = species.T
-        relative_humidity[scenario_index, month_index] = record["relative_humidity"]
+        other_species = np.ones(len(_COMPONENTS), dtype=bool)
+        other_species[_TYPE_SPECIES_INDEX[record["aerosol_type"]]] = False
+        if np.any(species[:, other_species] != 0):
+            msg = f"{label}: species outside the aerosol type must have zero extinction"
+            raise ValueError(msg)
+        extinction[case] = record["extinction_per_m"]
+        species_extinction[case] = species.T
+        relative_humidity[case] = record["relative_humidity"]
         for name in metadata_names:
-            metadata[name][scenario_index, month_index] = record[name]
-        for name in composition_names:
-            compositions[name][scenario_index, month_index] = record[name]
-    for name in composition_names:
-        if not np.isfinite(compositions[name]).all():
+            metadata[name][case] = record[name]
+        for name in mix_names:
+            mixes[name][case] = record[name]
+    for name in mix_names:
+        if not np.isfinite(mixes[name]).all():
             msg = f"Catalogue build did not select complete metadata for {name}"
             raise ValueError(msg)
     for name in metadata_names:
@@ -2325,79 +2481,81 @@ def build_catalogue(
             msg = f"Catalogue build did not select complete metadata for {name}"
             raise ValueError(msg)
 
-    latitude_bands = np.broadcast_to(
-        np.array(
-            [
-                next(band for band in _BANDS if scenario.startswith(f"{band}_"))
-                for scenario in scenarios
-            ]
-        )[:, None],
-        (len(scenarios), len(months)),
-    )
-    loading_levels = np.broadcast_to(
-        np.array([scenario.rsplit("_", maxsplit=1)[-1] for scenario in scenarios])[
-            :, None
-        ],
-        (len(scenarios), len(months)),
-    )
+    case_dims = ("scenario", "aerosol_type", "month")
     dataset = xr.Dataset(
         {
             "extinction_per_m": (
-                ("scenario", "month", "altitude_m", "wavelength_nm"),
+                (*case_dims, "altitude_m", "wavelength_nm"),
                 extinction,
-                {"units": "m-1"},
+                {
+                    "units": "m-1",
+                    "description": (
+                        "Extinction of the case's aerosol type over the whole "
+                        "MERRA2 column, including above the tropopause"
+                    ),
+                },
             ),
             "species_extinction_550nm_per_m": (
-                ("scenario", "month", "species", "altitude_m"),
+                (*case_dims, "species", "altitude_m"),
                 species_extinction,
                 {
                     "units": "m-1",
                     "wavelength_nm": _REFERENCE_WAVELENGTH_NM,
                     "description": (
-                        "550 nm extinction per MERRA2 aerosol species bin; sums to "
+                        "550 nm extinction per MERRA2 aerosol species bin; zero "
+                        "for species outside the case's aerosol type; sums to "
                         "extinction_per_m at 550 nm"
                     ),
                 },
             ),
             "relative_humidity": (
-                ("scenario", "month", "altitude_m"),
+                (*case_dims, "altitude_m"),
                 relative_humidity,
                 {
                     "units": "1",
                     "description": (
-                        "MERRA2 RH clipped to 0-0.99 at grid points; outside the "
-                        "troposphere, the nearest tropospheric value"
+                        "MERRA2 RH clipped to 0-0.99 at grid points; below the "
+                        "surface, the surface value"
                     ),
                 },
             ),
-            "selection_type_aod_fraction": (
-                ("scenario", "month", "aerosol_type"),
-                compositions["selection_type_aod_fraction"],
+            "selection_species_aod_fraction": (
+                (*case_dims, "species"),
+                mixes["selection_species_aod_fraction"],
                 {
                     "units": "1",
                     "description": (
                         "Share of the selected column's 550 nm tropospheric AOD "
-                        "from each aerosol type"
+                        "of the aerosol type from each of its species bins"
                     ),
                 },
             ),
-            "candidate_median_type_aod_fraction": (
-                ("scenario", "month", "aerosol_type"),
-                compositions["candidate_median_type_aod_fraction"],
+            "candidate_median_species_aod_fraction": (
+                (*case_dims, "species"),
+                mixes["candidate_median_species_aod_fraction"],
                 {
                     "units": "1",
                     "description": (
-                        "Median share per aerosol type over the sampled columns "
-                        "in the loading window, renormalized to sum to 1; the "
-                        "composition the selection aims for"
+                        "Median share per species bin of the type's AOD over the "
+                        "sampled columns in the loading window, renormalized to "
+                        "sum to 1; the species mix the selection aims for"
                     ),
                 },
             ),
-            "latitude_band": (("scenario", "month"), latitude_bands),
-            "loading": (("scenario", "month"), loading_levels),
+            "latitude_band": (
+                ("scenario",),
+                [
+                    next(band for band in _BANDS if scenario.startswith(f"{band}_"))
+                    for scenario in scenarios
+                ],
+            ),
+            "loading": (
+                ("scenario",),
+                [scenario.rsplit("_", maxsplit=1)[-1] for scenario in scenarios],
+            ),
             **{
                 name: (
-                    ("scenario", "month"),
+                    case_dims,
                     np.asarray(values).astype(
                         "datetime64[ns]" if name == "selected_time" else float
                     ),
@@ -2408,16 +2566,16 @@ def build_catalogue(
         },
         coords={
             "scenario": scenarios,
-            "month": months,
-            "species": list(_COMPONENTS),
             "aerosol_type": (
                 "aerosol_type",
-                list(_AEROSOL_TYPES),
+                aerosol_types,
                 {
                     "long_names": json.dumps(_AEROSOL_TYPE_NAMES),
                     "species": json.dumps(_AEROSOL_TYPES),
                 },
             ),
+            "month": months,
+            "species": list(_COMPONENTS),
             "altitude_m": (
                 "altitude_m",
                 _TARGET_ALTITUDES_M,
@@ -2431,7 +2589,7 @@ def build_catalogue(
         },
         attrs={
             "catalogue_version": "v1",
-            "schema_version": 2,
+            "schema_version": 3,
             "source_products": "M2I3NVAER, M2I3NVASM, M2I1NXASM",
             "source_data_version": "MERRA2 5.12.4",
             "source_years": f"{start_year}-{end_year}",
@@ -2440,28 +2598,37 @@ def build_catalogue(
                 "MERRA2 geopotential height converted to geometric height and "
                 "offset by EGM2008 geoid undulation above the WGS84 ellipsoid"
             ),
-            "aod_definition": "Sum(extinction * hydrostatic layer thickness) for PL >= TROPPB",
+            "aod_definition": (
+                "Tropospheric AOD: sum(extinction * hydrostatic layer thickness) "
+                "over model layers, counting only the part of the layer containing "
+                "the tropopause (TROPPB interpolated to height) that lies below it"
+            ),
             "layer_thickness_definition": "287.05 * T / 9.80665 * DELP / PL",
             "reference_wavelength_nm": 550.0,
-            "loading_percentile_method": "Area-weighted individual columns; weighted reservoir sample",
+            "loading_percentile_method": (
+                "Separately for each aerosol type: percentiles of the type's "
+                "tropospheric 550 nm AOD over area-weighted individual columns; "
+                "weighted reservoir sample shared by all types"
+            ),
             "loading_windows": json.dumps(_TIERS, sort_keys=True),
             "profile_selection": (
-                "Actual candidate minimizing the sum of two distances from the "
-                "window's medians, each divided by its median over the window: "
-                "profile shape, mean squared difference in "
-                "log1p(shape / median_positive_shape) with shape = extinction / "
-                "column AOD; and composition, sum of squared differences in "
-                "sqrt(aerosol-type share of 550 nm AOD) from the renormalized "
-                "median shares"
+                "Actual candidate with positive AOD of the type minimizing the "
+                "sum of two distances from the window's medians, each divided by "
+                "its median over the window: profile shape, mean squared "
+                "difference in log1p(shape / median_positive_shape) with shape = "
+                "the type's tropospheric extinction / its tropospheric AOD; and "
+                "species mix, sum of squared differences in sqrt(species share of "
+                "the type's 550 nm AOD) from the renormalized median shares"
             ),
             "candidate_sampling_seed": seed,
             "candidate_reservoir_size": reservoir_size,
             "profile_altitude_grid": (
-                "0-20 km every 250 m; zero below ground and above the "
-                "tropopause (TROPPB interpolated to height); values chosen so "
-                "the trapezoid integral on this grid equals the native-layer "
-                "tropospheric AOD, counting only the part of the layer "
-                "containing the tropopause that lies below it"
+                "Every 250 m to 20 km, 1 km to 50 km, 2 km to 84 km; the whole "
+                "MERRA2 column (model top about 80 km), including above the "
+                "tropopause; zero below ground; values chosen so the trapezoid "
+                "integral on this grid equals the native-layer column AOD. "
+                "Selection uses tropospheric AOD; sasktran2 cuts profiles at "
+                "tropopause_altitude_m by default"
             ),
             "optical_table_files": json.dumps(_OPTICS_FILES),
             "remote_access": _input_access_description(data_root, stage_daily),
@@ -2498,7 +2665,7 @@ def build_catalogue(
             {
                 key: value
                 for key, value in record.items()
-                if key not in _ColumnProfiles._fields
+                if key not in _PROFILE_RECORD_KEYS
             }
             for record in records
         ],
@@ -2517,7 +2684,9 @@ def build_catalogue(
     try:
         checkpoint_dir.rmdir()
     except OSError as exc:
-        logging.warning("Unable to remove checkpoint directory %s: %s", checkpoint_dir, exc)
+        logging.warning(
+            "Unable to remove checkpoint directory %s: %s", checkpoint_dir, exc
+        )
     return catalogue_path
 
 
@@ -2557,8 +2726,8 @@ def main() -> None:
         default=True,
         help=(
             "Download each remote day's granules to temporary storage before "
-            "processing (default); --no-stage-daily streams them with HTTP "
-            "range reads instead"
+            "sampling them (default); --no-stage-daily streams them with HTTP "
+            "range reads instead. Selected columns are always range-read"
         ),
     )
     parser.add_argument(

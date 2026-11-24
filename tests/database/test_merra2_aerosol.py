@@ -81,7 +81,7 @@ def _synthetic_table(path: Path) -> Path:
     return path
 
 
-@pytest.fixture
+@pytest.fixture()
 def optics_root(tmp_path) -> Path:
     root = tmp_path / "optics"
     root.mkdir()
@@ -89,7 +89,7 @@ def optics_root(tmp_path) -> Path:
     return root
 
 
-@pytest.fixture
+@pytest.fixture()
 def db_root(tmp_path) -> Path:
     root = tmp_path / "cache"
     root.mkdir()
@@ -99,6 +99,19 @@ def db_root(tmp_path) -> Path:
 def test_species_map_matches_catalogue_builder():
     build = _load_build_module()
     assert build._COMPONENTS == merra2_aerosol.MERRA2_AEROSOL_SPECIES
+
+
+def test_aerosol_types_match_catalogue_builder():
+    build = _load_build_module()
+    assert build._AEROSOL_TYPES == merra2_aerosol.MERRA2_AEROSOL_TYPES
+    assert set(merra2_aerosol.MERRA2_AEROSOL_TYPE_NAMES.values()) == set(
+        merra2_aerosol.MERRA2_AEROSOL_TYPES
+    )
+    # The builder's display names are the runtime names with spaces.
+    assert {
+        name.replace("_", " "): code
+        for name, code in merra2_aerosol.MERRA2_AEROSOL_TYPE_NAMES.items()
+    } == {name: code for code, name in build._AEROSOL_TYPE_NAMES.items()}
 
 
 def test_wavelength_rounding_matches_catalogue_builder():
@@ -135,6 +148,11 @@ def test_exported_from_database_package():
         is merra2_aerosol.OpticalDatabaseMERRA2Aerosol
     )
     assert sk.database.merra2_optics_table is merra2_aerosol.merra2_optics_table
+    assert sk.database.MERRA2_AEROSOL_TYPES is merra2_aerosol.MERRA2_AEROSOL_TYPES
+    assert (
+        sk.database.MERRA2_AEROSOL_TYPE_NAMES
+        is merra2_aerosol.MERRA2_AEROSOL_TYPE_NAMES
+    )
 
 
 def test_generate_maps_table_to_scalar_database(optics_root, db_root):

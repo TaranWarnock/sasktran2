@@ -27,6 +27,25 @@ MERRA2_AEROSOL_SPECIES = {
     "OCPHOBIC": ("optics_OC.v1_3.nc", 0),
 }
 
+# MERRA2 aerosol types -> their species; must match _AEROSOL_TYPES in the
+# catalogue builder
+MERRA2_AEROSOL_TYPES = {
+    "SU": ("SO4",),
+    "DU": tuple(f"DU{i:03d}" for i in range(1, 6)),
+    "SS": tuple(f"SS{i:03d}" for i in range(1, 6)),
+    "BC": ("BCPHILIC", "BCPHOBIC"),
+    "OC": ("OCPHILIC", "OCPHOBIC"),
+}
+
+# Names accepted for each aerosol type code, alongside the code itself
+MERRA2_AEROSOL_TYPE_NAMES = {
+    "sulfate": "SU",
+    "dust": "DU",
+    "sea_salt": "SS",
+    "black_carbon": "BC",
+    "organic_carbon": "OC",
+}
+
 _STANDARD_DATABASE_PREFIX = "merra2/aerosol_optics/"
 
 # TODO(maintainer): upload the tables to

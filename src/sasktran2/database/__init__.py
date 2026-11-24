@@ -4,6 +4,8 @@ from __future__ import annotations
 from .hitran import HITRANDatabase, HITRANLineDatabase
 from .merra2_aerosol import (
     MERRA2_AEROSOL_SPECIES,
+    MERRA2_AEROSOL_TYPE_NAMES,
+    MERRA2_AEROSOL_TYPES,
     OpticalDatabaseMERRA2Aerosol,
     ScalarOnlyOpticalDatabaseMixin,
     merra2_optics_table,

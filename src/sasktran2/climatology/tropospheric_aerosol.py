@@ -15,6 +15,8 @@ import sasktran2 as sk
 from sasktran2.constituent import ExtinctionScatterer
 from sasktran2.database.merra2_aerosol import (
     MERRA2_AEROSOL_SPECIES,
+    MERRA2_AEROSOL_TYPE_NAMES,
+    MERRA2_AEROSOL_TYPES,
     OpticalDatabaseMERRA2Aerosol,
     ScalarOnlyOpticalDatabaseMixin,
 )
@@ -25,27 +27,45 @@ from sasktran2.database.tropospheric_aerosol import (
 from sasktran2.optical.base import OpticalProperty, OpticalQuantities
 from sasktran2.optical.database import OpticalDatabaseGenericScattererRust
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 _REFERENCE_WAVELENGTH_NM = 550.0
 _MONTHS = (1, 4, 7, 10)
 _BANDS = ("sh_midlat", "tropical", "nh_midlat")
 _LOADINGS = ("low", "typical", "elevated", "extreme")
-_REQUIRED_METADATA = (
-    "latitude_band",
-    "loading",
+_CASE_DIMS = ("scenario", "aerosol_type", "month")
+_SCENARIO_METADATA = ("latitude_band", "loading")
+_CASE_METADATA = (
     "selection_aod_550nm",
     "selection_percentile",
     "candidate_count",
+    "column_total_aod_550nm",
     "selected_latitude_degrees",
     "selected_longitude_degrees",
     "selected_time",
     "tropopause_altitude_m",
     "surface_altitude_m",
 )
+_REQUIRED_METADATA = _SCENARIO_METADATA + _CASE_METADATA
+
+
+def _resolve_aerosol_type(aerosol_type: str) -> str:
+    """Return the type code for a code or name such as ``"DU"`` or ``"dust"``."""
+    if isinstance(aerosol_type, str):
+        key = aerosol_type.strip()
+        if key.upper() in MERRA2_AEROSOL_TYPES:
+            return key.upper()
+        name = key.lower().replace(" ", "_").replace("-", "_")
+        if name in MERRA2_AEROSOL_TYPE_NAMES:
+            return MERRA2_AEROSOL_TYPE_NAMES[name]
+    choices = ", ".join(
+        f"{code} ({name})" for name, code in MERRA2_AEROSOL_TYPE_NAMES.items()
+    )
+    msg = f"aerosol_type must be one of {choices}; got {aerosol_type!r}"
+    raise ValueError(msg)
 
 
 def _validate_month(month: int) -> int:
-    if isinstance(month, (bool, np.bool_)) or not isinstance(month, (int, np.integer)):
+    if isinstance(month, bool | np.bool_) or not isinstance(month, int | np.integer):
         msg = f"month must be one of {_MONTHS}, got {month!r}"
         raise ValueError(msg)
     if int(month) not in _MONTHS:
@@ -141,7 +161,7 @@ def _validate_catalogue(data: xr.Dataset) -> None:
     ):
         msg = "Incompatible tropospheric aerosol catalogue schema/version"
         raise ValueError(msg)
-    for coordinate in ("scenario", "month", "species", "altitude_m", "wavelength_nm"):
+    for coordinate in (*_CASE_DIMS, "species", "altitude_m", "wavelength_nm"):
         if coordinate not in data.coords or data[coordinate].dims != (coordinate,):
             msg = f"Catalogue requires a one-dimensional {coordinate} coordinate"
             raise ValueError(msg)
@@ -153,14 +173,16 @@ def _validate_catalogue(data: xr.Dataset) -> None:
     ]:
         msg = "Catalogue scenarios must contain the twelve SAGE band/loading names"
         raise ValueError(msg)
+    if data.aerosol_type.values.tolist() != list(MERRA2_AEROSOL_TYPES):
+        msg = f"Catalogue aerosol types must be exactly {list(MERRA2_AEROSOL_TYPES)}"
+        raise ValueError(msg)
     altitude = _grid(data.altitude_m.values, "Catalogue altitude_m")
     wavelength = _grid(data.wavelength_nm.values, "Catalogue wavelength_nm")
     if altitude[0] < 0 or wavelength[0] <= 0:
         msg = "Catalogue altitudes and wavelengths must be nonnegative and positive"
         raise ValueError(msg)
     if (
-        data.extinction_per_m.dims
-        != ("scenario", "month", "altitude_m", "wavelength_nm")
+        data.extinction_per_m.dims != (*_CASE_DIMS, "altitude_m", "wavelength_nm")
         or data.extinction_per_m.attrs.get("units") != "m-1"
     ):
         msg = "Catalogue extinction_per_m has invalid dimensions or units"
@@ -176,13 +198,13 @@ def _validate_catalogue(data: xr.Dataset) -> None:
     for name, dims, units, valid in (
         (
             "species_extinction_550nm_per_m",
-            ("scenario", "month", "species", "altitude_m"),
+            (*_CASE_DIMS, "species", "altitude_m"),
             "m-1",
             lambda values: np.all(values >= 0),
         ),
         (
             "relative_humidity",
-            ("scenario", "month", "altitude_m"),
+            (*_CASE_DIMS, "altitude_m"),
             "1",
             lambda values: np.all((values >= 0) & (values <= 1)),
         ),
@@ -196,10 +218,26 @@ def _validate_catalogue(data: xr.Dataset) -> None:
         ):
             msg = f"Catalogue {name} is missing or has invalid dimensions, units or values"
             raise ValueError(msg)
-    for name in _REQUIRED_METADATA:
-        if name not in data or data[name].dims != ("scenario", "month"):
-            msg = f"Catalogue requires scenario/month metadata field {name!r}"
-            raise ValueError(msg)
+    for names, dims in (
+        (_SCENARIO_METADATA, ("scenario",)),
+        (_CASE_METADATA, _CASE_DIMS),
+    ):
+        for name in names:
+            if name not in data or data[name].dims != dims:
+                msg = f"Catalogue requires {'/'.join(dims)} metadata field {name!r}"
+                raise ValueError(msg)
+    other_species = xr.DataArray(
+        [
+            [name not in MERRA2_AEROSOL_TYPES[code] for name in data.species.values]
+            for code in data.aerosol_type.values
+        ],
+        dims=("aerosol_type", "species"),
+    )
+    if (data.species_extinction_550nm_per_m.where(other_species, 0.0) != 0).any():
+        msg = (
+            "Catalogue species extinction must be zero outside each case's aerosol type"
+        )
+        raise ValueError(msg)
     if data.tropopause_altitude_m.attrs.get("units") != "m":
         msg = "Catalogue tropopause_altitude_m must use metres"
         raise ValueError(msg)
@@ -207,30 +245,39 @@ def _validate_catalogue(data: xr.Dataset) -> None:
 
 def scenarios(
     month: int | None = None,
+    aerosol_type: str | None = None,
     version: str = "v1",
     *,
     path: str | Path | None = None,
     db_root: str | Path | None = None,
 ) -> xr.Dataset:
-    """List the twelve band/loading cases and their selected-profile metadata.
+    """List the band/loading cases of each aerosol type and their metadata.
 
     If ``month`` is provided, select that exact month from 1, 4, 7, or 10.
+    If ``aerosol_type`` is provided (a code such as ``"DU"`` or a name such as
+    ``"dust"``), select that type. ``selection_aod_550nm`` is the selected
+    column's tropospheric AOD of the type; ``column_total_aod_550nm`` is its
+    tropospheric AOD of all types.
     """
     data = load_dataset(version, path=path, db_root=db_root)
     result = data[list(_REQUIRED_METADATA)]
     if month is not None:
         result = result.sel(month=_validate_month(month), drop=True)
+    if aerosol_type is not None:
+        result = result.sel(aerosol_type=_resolve_aerosol_type(aerosol_type))
     return result
 
 
 def profile(
     scenario: str,
     *,
+    aerosol_type: str,
     month: int,
     wavelength_nm: float = 550.0,
     altitudes_m: np.ndarray | None = None,
     smoothing_fwhm_m: float = 0.0,
     ground_altitude_m: float | None = None,
+    cut_at_tropopause: bool = True,
     version: str = "v1",
     path: str | Path | None = None,
     db_root: str | Path | None = None,
@@ -238,25 +285,42 @@ def profile(
     """Return one MERRA2 extinction profile on an optional altitude grid.
 
     ``scenario`` is an exact SAGE-style name such as ``"tropical_typical"``.
+    ``aerosol_type`` selects one of the five MERRA2 aerosol types, by code or
+    name: ``"SU"``/``"sulfate"``, ``"DU"``/``"dust"``, ``"SS"``/``"sea_salt"``,
+    ``"BC"``/``"black_carbon"`` or ``"OC"``/``"organic_carbon"`` (any case).
+    Each type's loading levels come from percentiles of that type's own
+    tropospheric AOD, and the profile holds only that type's aerosol.
     ``month`` must be one of 1, 4, 7, or 10. The default extinction wavelength
     is 550 nm; other wavelengths may be selected within the catalogue's
     spectral range. No stratospheric extension is applied.
 
-    ``altitudes_m`` defaults to the catalogue grid, where the catalogue values
-    are returned unchanged. Other grids receive a conservative remap: each
-    level's extinction is the catalogue AOD within its trapezoid cell divided
-    by the cell width, using a monotone spline of the cumulative AOD.
-    Extinction is zero below the surface and above the tropopause, and the
-    AOD of cells that cross those boundaries moves to the nearest
-    tropospheric level. The trapezoid integral of ``extinction_per_m`` over
-    ``altitude_m`` therefore equals the catalogue column AOD whenever the grid
-    spans the surface to the tropopause; ``tropospheric_aod`` is that integral.
-    At least one level must lie between the surface and the tropopause.
+    The catalogue stores the whole MERRA2 column, from the surface to above the
+    model top (about 80 km), including aerosol above the tropopause. Its grid
+    is 250 m apart up to 20 km and coarser above. ``cut_at_tropopause``
+    (default ``True``) keeps only the troposphere: extinction is zero above the
+    tropopause. Set it to ``False`` to keep the whole column; the part above
+    the tropopause overlaps stratospheric aerosol, mostly sulfate, so take care
+    when also adding :mod:`sasktran2.climatology.stratospheric_aerosol`.
+
+    ``altitudes_m`` defaults to the catalogue grid. Uncut, the catalogue values
+    are returned unchanged there. Other grids, and the cut at the tropopause,
+    use a conservative remap: each level's extinction is the catalogue AOD
+    within its trapezoid cell divided by the cell width, using a monotone
+    spline of the cumulative AOD. Extinction is zero below the surface and
+    above the top of the profile (the tropopause, or the top of the catalogue
+    grid when uncut), and the AOD of cells that cross those boundaries moves to
+    the nearest valid level. The trapezoid integral of ``extinction_per_m``
+    over ``altitude_m`` therefore equals the catalogue AOD between the surface
+    and the top of the profile whenever the grid spans them; ``aod`` is that
+    integral and ``tropospheric_aod`` the part below the tropopause. At least
+    one level must lie between the surface and the top of the profile.
 
     ``smoothing_fwhm_m`` (default 0, off) applies a Gaussian of that full width
     at half maximum to the catalogue profile before remapping. It acts only
-    between the surface and the tropopause, never moves aerosol across them,
-    and keeps the column AOD exactly at every wavelength. Unlike the
+    between the surface and the top of the profile, never moves aerosol across
+    them, and keeps the AOD there exactly at every wavelength. It acts only on
+    the regular 250 m part of the catalogue grid (up to 20 km); an uncut
+    profile is left unsmoothed above that. Unlike the
     stratospheric climatology, the catalogue is not noisy: its structure
     (boundary-layer top, elevated dust and smoke layers) comes from MERRA2, so
     smoothing is optional and widths above a few hundred metres blur it.
@@ -272,7 +336,15 @@ def profile(
     tropopause (0) or in the troposphere (1).
     """
     data = load_dataset(version, path=path, db_root=db_root)
-    case = _prepared_case(data, scenario, month, smoothing_fwhm_m, ground_altitude_m)
+    case = _prepared_case(
+        data,
+        scenario,
+        aerosol_type,
+        month,
+        smoothing_fwhm_m,
+        ground_altitude_m,
+        cut_at_tropopause,
+    )
     return _profile(data, case, wavelength_nm, altitudes_m)
 
 
@@ -283,47 +355,61 @@ def _cell_bounds(altitudes: np.ndarray) -> np.ndarray:
     )
 
 
+def _valid_source_levels(
+    altitudes: np.ndarray, surface: float, top: float
+) -> np.ndarray:
+    """Catalogue levels at or above the surface whose cells start below ``top``.
+
+    The builder folds AOD below the surface into the first level above it, so
+    that level's whole cell counts. At the top, the level whose cell holds
+    ``top`` counts, and the remap keeps only the part of its cell below.
+    """
+    return (altitudes >= surface) & (_cell_bounds(altitudes)[:-1] < top)
+
+
 def _conservative_remap(
     source_altitudes: np.ndarray,
     source_extinction: np.ndarray,
     target: np.ndarray,
     surface: float,
-    tropopause: float,
+    top: float,
 ) -> np.ndarray:
     """Remap a catalogue profile to ``target`` via its cumulative AOD.
 
     Catalogue extinction is AOD per trapezoid cell (the builder's
-    representation). Each tropospheric level's cell AOD is placed in its cell,
-    with the outermost cells clipped to the surface and tropopause, and the
-    cumulative AOD is interpolated with a monotone (PCHIP) spline. Each target
-    level receives the AOD in its own trapezoid cell; cells of levels below
-    the surface or above the tropopause fold into the nearest tropospheric
-    level, whose extinction is the cell AOD divided by the cell width.
+    representation). Each valid level's cell AOD is placed in its cell, with
+    the lowest cell clipped to the surface, and the cumulative AOD is
+    interpolated with a monotone (PCHIP) spline and cut at ``top`` (the
+    tropopause, or the top of the catalogue grid). Each target level receives
+    the AOD in its own trapezoid cell; cells of levels below the surface or
+    above ``top`` fold into the nearest valid level, whose extinction is the
+    cell AOD divided by the cell width.
 
-    The result is zero outside the surface-tropopause range, nonnegative, and
-    its trapezoid integral equals the catalogue AOD within the target's
-    altitude range. On the catalogue grid it reproduces the catalogue.
+    The result is zero outside the surface-to-top range, nonnegative, and its
+    trapezoid integral equals the catalogue AOD from the surface to ``top``
+    within the target's altitude range. On the catalogue grid with ``top`` at
+    the top of the grid it reproduces the catalogue.
     """
-    valid_source = (source_altitudes >= surface) & (source_altitudes <= tropopause)
-    valid_target = (target >= surface) & (target <= tropopause)
+    valid_source = _valid_source_levels(source_altitudes, surface, top)
+    valid_target = (target >= surface) & (target <= top)
     if not valid_source.any() or not valid_target.any():
         grid = "Catalogue" if not valid_source.any() else "altitudes_m"
         msg = (
-            f"{grid} has no level between the surface ({surface:g} m) and "
-            f"tropopause ({tropopause:g} m)"
+            f"{grid} has no level between the surface ({surface:g} m) and the "
+            f"top of the profile ({top:g} m)"
         )
         raise ValueError(msg)
     first, last = np.flatnonzero(valid_source)[[0, -1]]
     source_bounds = _cell_bounds(source_altitudes)
     bounds = source_bounds[first : last + 2].copy()
     bounds[0] = min(max(surface, source_altitudes[0]), source_altitudes[first])
-    bounds[-1] = max(min(tropopause, source_altitudes[-1]), source_altitudes[last])
     source_aod = source_extinction * np.diff(source_bounds)
     cumulative = np.concatenate(([0.0], np.cumsum(source_aod[first : last + 1])))
     spline = PchipInterpolator(bounds, cumulative)
     target_bounds = _cell_bounds(target)
     cell_aod = np.maximum(
-        np.diff(spline(np.clip(target_bounds, bounds[0], bounds[-1]))), 0.0
+        np.diff(spline(np.clip(target_bounds, bounds[0], min(top, bounds[-1])))),
+        0.0,
     )
     first, last = np.flatnonzero(valid_target)[[0, -1]]
     cell_aod[first] += cell_aod[:first].sum()
@@ -362,18 +448,35 @@ def _smoothing_matrix(
     return matrix
 
 
-def _smooth(case: xr.Dataset, fwhm_m: float) -> xr.Dataset:
-    """Smooth a case's extinction between its surface and tropopause.
+def _regular_levels(altitudes: np.ndarray, valid: np.ndarray) -> np.ndarray:
+    """The valid levels up to the first change in the grid spacing."""
+    indices = np.flatnonzero(valid)
+    regular = np.zeros_like(valid)
+    if len(indices) < 3:
+        regular[indices] = True
+        return regular
+    spacing = np.diff(altitudes[indices])
+    changes = np.flatnonzero(~np.isclose(spacing, spacing[0], rtol=1e-9, atol=0.0))
+    end = changes[0] + 1 if len(changes) else len(indices)
+    regular[indices[:end]] = True
+    return regular
 
-    The same AOD-conserving operator is applied to the total spectral
-    extinction and to every species, so species still sum to the total.
+
+def _smooth(case: xr.Dataset, fwhm_m: float, top: float) -> xr.Dataset:
+    """Smooth a case's extinction between its surface and the top of the profile.
+
+    Smoothing covers the regular part of the catalogue grid (250 m spacing, up
+    to 20 km); valid levels above it, on the coarser grid, are unchanged. The
+    same AOD-conserving operator is applied to the total spectral extinction
+    and to every species, so species still sum to the total.
     """
     altitudes = case.altitude_m.values
-    valid = (altitudes >= float(case.surface_altitude_m)) & (
-        altitudes <= float(case.tropopause_altitude_m)
-    )
+    valid = _valid_source_levels(altitudes, float(case.surface_altitude_m), top)
+    regular = _regular_levels(altitudes, valid)
     widths = np.diff(_cell_bounds(altitudes))
-    matrix = _smoothing_matrix(altitudes, valid, fwhm_m)
+    matrix = _smoothing_matrix(altitudes, regular, fwhm_m)
+    unsmoothed = np.flatnonzero(valid & ~regular)
+    matrix[unsmoothed, unsmoothed] = 1.0
     case = case.copy()
     for name in ("extinction_per_m", "species_extinction_550nm_per_m"):
         values = case[name]
@@ -398,15 +501,26 @@ def _smooth(case: xr.Dataset, fwhm_m: float) -> xr.Dataset:
 def _prepared_case(
     data: xr.Dataset,
     scenario: str,
+    aerosol_type: str,
     month: int,
     smoothing_fwhm_m: float,
     ground_altitude_m: float | None,
+    cut_at_tropopause: bool = True,
 ) -> xr.Dataset:
-    """Select one case, optionally move it to the model ground and smooth it."""
+    """Select one case, optionally move it to the model ground and smooth it.
+
+    The case's ``profile_top_m`` attribute is where its profile ends: the
+    tropopause when ``cut_at_tropopause``, otherwise the top of the catalogue
+    grid.
+    """
     selected_month = _validate_month(month)
+    code = _resolve_aerosol_type(aerosol_type)
     names = data.scenario.values.tolist()
     if names.count(scenario) != 1:
         msg = f"Select an exact aerosol scenario; got {scenario!r}, available: {names}"
+        raise ValueError(msg)
+    if not isinstance(cut_at_tropopause, bool | np.bool_):
+        msg = f"cut_at_tropopause must be True or False, got {cut_at_tropopause!r}"
         raise ValueError(msg)
     try:
         fwhm = float(smoothing_fwhm_m)
@@ -416,7 +530,7 @@ def _prepared_case(
         msg = "smoothing_fwhm_m must be finite and nonnegative"
         raise ValueError(msg)
     shift = 0.0
-    case = data.sel(scenario=scenario, month=selected_month)
+    case = data.sel(scenario=scenario, aerosol_type=code, month=selected_month)
     if ground_altitude_m is not None:
         try:
             ground = float(ground_altitude_m)
@@ -432,11 +546,19 @@ def _prepared_case(
         for name in ("surface_altitude_m", "tropopause_altitude_m"):
             case[name] = case[name] + shift
             case[name].attrs["units"] = "m"
+    top = (
+        float(case.tropopause_altitude_m)
+        if cut_at_tropopause
+        else float(case.altitude_m.values[-1])
+    )
     if fwhm > 0:
-        case = _smooth(case, fwhm)
+        case = _smooth(case, fwhm, top)
     case.attrs.update(
         scenario=scenario,
+        aerosol_type=code,
         month=selected_month,
+        cut_at_tropopause=int(bool(cut_at_tropopause)),
+        profile_top_m=top,
         smoothing_fwhm_m=fwhm,
         ground_altitude_m=(
             "catalogue" if ground_altitude_m is None else float(ground_altitude_m)
@@ -471,8 +593,16 @@ def _profile(
     )
     tropopause = float(case.tropopause_altitude_m)
     surface = float(case.surface_altitude_m)
+    top = float(case.attrs["profile_top_m"])
     prepared = _conservative_remap(
-        source_altitudes, source_extinction, target, surface, tropopause
+        source_altitudes, source_extinction, target, surface, top
+    )
+    tropospheric = (
+        prepared
+        if top == tropopause
+        else _conservative_remap(
+            source_altitudes, source_extinction, target, surface, tropopause
+        )
     )
     below = target < surface
     above = target > tropopause
@@ -491,15 +621,28 @@ def _profile(
                     "flag_meanings": "below_surface above_tropopause troposphere",
                 },
             ),
-            "tropospheric_aod": xr.DataArray(
+            "aod": xr.DataArray(
                 float(trapezoid(prepared, target)),
                 attrs={
                     "units": "1",
                     "wavelength_nm": wavelength,
                     "description": (
                         "Trapezoid integral of extinction_per_m over altitude_m. "
-                        "Equals the catalogue column AOD when altitude_m spans "
-                        "the surface to the tropopause."
+                        "Equals the catalogue AOD from the surface to the top of "
+                        "the profile when altitude_m spans them."
+                    ),
+                },
+            ),
+            "tropospheric_aod": xr.DataArray(
+                float(trapezoid(tropospheric, target)),
+                attrs={
+                    "units": "1",
+                    "wavelength_nm": wavelength,
+                    "description": (
+                        "Part of aod below the tropopause; equal to aod when the "
+                        "profile is cut at the tropopause. Equals the catalogue "
+                        "tropospheric AOD when altitude_m spans the surface to "
+                        "the tropopause."
                     ),
                 },
             ),
@@ -514,7 +657,9 @@ def _profile(
             name: case.attrs[name]
             for name in (
                 "scenario",
+                "aerosol_type",
                 "month",
+                "cut_at_tropopause",
                 "smoothing_fwhm_m",
                 "ground_altitude_m",
                 "vertical_shift_m",
@@ -522,7 +667,11 @@ def _profile(
         },
         extinction_wavelength_nm=wavelength,
         source_tropopause_field="TROPPB",
-        profile_extension="none; extinction is zero above the tropopause",
+        profile_extension=(
+            "none; extinction is zero above the tropopause"
+            if top == tropopause
+            else "none; extinction is zero above the top of the catalogue grid"
+        ),
     )
     return result
 
@@ -624,11 +773,27 @@ def _merra2_optics(
     and the P11 phase moments come from mixing the MERRA2 species optics at
     each level's relative humidity, weighting each species by its mass
     (550 nm extinction divided by its 550 nm mass extinction efficiency).
+    The database covers the levels the profile uses (see ``profile_top_m``).
     """
     wavelengths = case.wavelength_nm.values
     if _REFERENCE_WAVELENGTH_NM not in wavelengths:
         msg = f"Catalogue wavelengths must include {_REFERENCE_WAVELENGTH_NM:g} nm"
         raise ValueError(msg)
+    # Tabulate the optics only where the profile can be nonzero, plus one
+    # level either side: with the default cut at the tropopause this skips
+    # the column above it, keeping the phase-function table small.
+    used = np.flatnonzero(
+        _valid_source_levels(
+            case.altitude_m.values,
+            float(case.surface_altitude_m),
+            float(case.attrs["profile_top_m"]),
+        )
+    )
+    case = case.isel(
+        altitude_m=slice(
+            max(used[0] - 1, 0), min(used[-1] + 2, case.sizes["altitude_m"])
+        )
+    )
     humidity = case.relative_humidity.reset_coords(drop=True)
     extinction = 0.0
     scattering = 0.0
@@ -739,11 +904,11 @@ class TroposphericAerosolConstituent(ExtinctionScatterer):
         extinction = selected.extinction_per_m.values
         kwargs = {}
         if self._parameterized_by_altitude:
-            # Optics are tabulated on the catalogue grid; levels outside it are
-            # outside the troposphere, where the extinction is zero.
-            kwargs["altitude_m"] = np.clip(
-                altitudes, case.altitude_m.values[0], case.altitude_m.values[-1]
-            )
+            # Optics are tabulated on the catalogue levels the profile uses;
+            # levels outside them are below the surface or above the profile,
+            # where extinction is zero.
+            tabulated = optical_property._database.altitude_m.values
+            kwargs["altitude_m"] = np.clip(altitudes, tabulated[0], tabulated[-1])
         ExtinctionScatterer.__init__(
             self, optical_property, altitudes, extinction, wavelength_nm, **kwargs
         )
@@ -784,36 +949,43 @@ class TroposphericAerosolConstituent(ExtinctionScatterer):
 def constituent(
     scenario: str,
     *,
+    aerosol_type: str,
     month: int,
     optical_property: OpticalProperty | None = None,
     wavelength_nm: float = 550.0,
     altitudes_m: np.ndarray | None = None,
     smoothing_fwhm_m: float = 0.0,
     ground_altitude_m: float | None = None,
+    cut_at_tropopause: bool = True,
     version: str = "v1",
     path: str | Path | None = None,
     db_root: str | Path | None = None,
     optics_root: str | Path | None = None,
     max_legendre_moments: int | None = None,
 ) -> TroposphericAerosolConstituent:
-    """Create an extinction-normalized aerosol constituent.
+    """Create an extinction-normalized constituent for one aerosol type.
 
-    For example, add a typical tropical July case to an atmosphere whose
-    ground is at 0 m::
+    For example, add typical tropical July dust to an atmosphere whose ground
+    is at 0 m::
 
-        atmosphere["tropospheric_aerosol"] = (
-            sk.climatology.tropospheric_aerosol.constituent(
-                "tropical_typical", month=7, ground_altitude_m=0.0
-            )
+        atmosphere["dust"] = sk.climatology.tropospheric_aerosol.constituent(
+            "tropical_typical", aerosol_type="dust", month=7, ground_altitude_m=0.0
         )
+
+    Each constituent holds one MERRA2 aerosol type (see :func:`profile` for the
+    accepted ``aerosol_type`` values), chosen from that type's own loading
+    levels. Build a mixture by adding one constituent per type, under
+    different names, each at its own loading level, for example elevated dust
+    with typical sulfate.
 
     With the default ``altitudes_m=None`` the profile is remapped onto the
     atmosphere's model altitudes when it is added, conserving AOD: the
-    trapezoid integral over the model grid equals the catalogue column AOD.
+    trapezoid integral over the model grid equals the catalogue AOD.
     Plain linear interpolation onto a coarse grid would not; on a 1 km grid
     it lost a median 24% of the AOD across the catalogue cases. Passing
     ``altitudes_m`` fixes the grid instead, as in :func:`profile`.
-    ``smoothing_fwhm_m`` and ``ground_altitude_m`` are described in
+    ``smoothing_fwhm_m``, ``ground_altitude_m`` and ``cut_at_tropopause``
+    (default ``True``: no aerosol above the tropopause) are described in
     :func:`profile`; smoothing applies to the species mixture as well, so the
     optics stay consistent with the extinction.
 
@@ -821,6 +993,8 @@ def constituent(
     create that profile with ``lower_extension="zero"``. Its default
     exponential taper below the observations models stratospheric aerosol
     reaching into the troposphere, which this constituent already includes.
+    With ``cut_at_tropopause=False`` this constituent also holds MERRA2
+    aerosol above the tropopause, which overlaps the stratospheric profile.
 
     By default the constituent is MERRA2-consistent and scalar only
     (``nstokes=1``): its extinction follows the catalogue spectra at every
@@ -854,7 +1028,15 @@ def constituent(
     catalogue's own spectra.
     """
     data = load_dataset(version, path=path, db_root=db_root)
-    case = _prepared_case(data, scenario, month, smoothing_fwhm_m, ground_altitude_m)
+    case = _prepared_case(
+        data,
+        scenario,
+        aerosol_type,
+        month,
+        smoothing_fwhm_m,
+        ground_altitude_m,
+        cut_at_tropopause,
+    )
     merra2_optics = optical_property is None
     if merra2_optics:
         optical_property = _MERRA2MixedAerosol(
