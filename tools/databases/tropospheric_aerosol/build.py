@@ -1184,9 +1184,9 @@ def _input_access_description(data_root: Path | None, stage_daily: bool) -> str:
         return "local MERRA2 granules"
     if stage_daily:
         return (
-            "GES DISC authenticated HTTP; full daily granules staged to local "
-            "temporary storage and deleted after processing; selected columns "
-            "read with HTTP range requests"
+            "GES DISC authenticated HTTP; full daily granules, for sampling "
+            "and for the selected columns, staged to local temporary storage "
+            "and deleted after processing"
         )
     return "GES DISC authenticated HTTP range streaming; no full granule downloads"
 

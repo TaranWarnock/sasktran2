@@ -1684,6 +1684,7 @@ def test_selected_columns_open_granules_like_the_daily_pass(monkeypatch, stage_d
 def test_input_access_description_matches_how_inputs_were_read(tmp_path):
     assert "range streaming" in build._input_access_description(None, False)
     assert "full daily granules" in build._input_access_description(None, True)
+    assert "range" not in build._input_access_description(None, True)
     assert "local" in build._input_access_description(tmp_path, False)
     assert "local" in build._input_access_description(tmp_path, True)
 
