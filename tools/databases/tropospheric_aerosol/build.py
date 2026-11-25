@@ -18,6 +18,7 @@ import logging
 import multiprocessing
 import os
 import random
+import re
 import shutil
 import tempfile
 import time
@@ -708,6 +709,58 @@ def _open_granule(location: Path | str, identity_callback=None):
 _RETRYABLE_DOWNLOAD_STATUS = frozenset({401, 403, 429, 500, 502, 503, 504})
 
 
+_URL_QUERY = re.compile(r"(https?://[^\s?#'\"<>]+)[?#][^\s'\"<>]*")
+
+
+def _redact_url_queries(text: str) -> str:
+    """Drop query strings and fragments from URLs in ``text``.
+
+    Earthdata Login redirects carry one-time authorization codes and signed
+    URLs carry access tokens in their query strings; neither belongs in logs.
+    """
+    return _URL_QUERY.sub(r"\1?<redacted>", text)
+
+
+class _RedactingFormatter(logging.Formatter):
+    """Formatter that redacts URL queries from records and their tracebacks.
+
+    Range-request errors from aiohttp carry the signed URL in their message,
+    and a failed month logs its exception with the traceback.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        return _redact_url_queries(super().format(record))
+
+
+def _redact_root_handlers() -> None:
+    """Make the root logger's handlers redact URL queries; safe to repeat.
+
+    Called by the parent and at the start of each month task, so spawned
+    month workers redact too (their initializer stays a standard-library
+    function so it unpickles in any child).
+    """
+    for handler in logging.getLogger().handlers:
+        if not isinstance(handler.formatter, _RedactingFormatter):
+            fmt = handler.formatter._fmt if handler.formatter is not None else None
+            handler.setFormatter(_RedactingFormatter(fmt))
+
+
+def _configure_logging(level: int, fmt: str) -> None:
+    """Configure the root logger with URL redaction."""
+    logging.basicConfig(level=level, format=fmt)
+    _redact_root_handlers()
+
+
+def _redacted_request_error(
+    exc: requests.RequestException,
+) -> requests.RequestException:
+    """``exc``, or a copy whose message has URL queries redacted."""
+    message = _redact_url_queries(str(exc))
+    if message == str(exc):
+        return exc
+    return type(exc)(message, response=exc.response)
+
+
 def _download_granule(location: str, destination: Path) -> dict:
     """Download ``location`` to ``destination``.
 
@@ -785,13 +838,18 @@ def _download_granule(location: str, destination: Path) -> dict:
             # redirect; each retry starts a fresh request and authentication.
             retryable = status in _RETRYABLE_DOWNLOAD_STATUS or status is None
             if not retryable or attempt == 4:
-                raise
+                redacted = _redacted_request_error(exc)
+                if redacted is exc:
+                    raise
+                # Drop the original, whose message holds the full URL, from
+                # the traceback as well.
+                raise redacted from None
             delay = min(2**attempt, 30) + random.uniform(0, 1)
             logging.warning(
                 "Transient MERRA2 download failure for %s (%s: %s); retrying in %.1f s",
                 Path(location).name,
                 type(exc).__name__,
-                exc,
+                _redact_url_queries(str(exc)),
                 delay,
             )
             time.sleep(delay)
@@ -1956,6 +2014,7 @@ def _process_month(
     checkpoint_config: dict | None = None,
     stage_daily: bool = False,
 ) -> list[dict]:
+    _redact_root_handlers()
     rng = np.random.default_rng(seed + month)
     reservoirs = {band: _WeightedReservoir(reservoir_size, rng) for band in _BANDS}
     days = _month_days(month, start_year, end_year)
@@ -2762,9 +2821,9 @@ def main() -> None:
     )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
-    logging.basicConfig(
-        level=logging.INFO if args.verbose else logging.WARNING,
-        format="%(asctime)s %(levelname)s %(message)s",
+    _configure_logging(
+        logging.INFO if args.verbose else logging.WARNING,
+        "%(asctime)s %(levelname)s %(message)s",
     )
     data_root = None if args.data_root is None else args.data_root.expanduser()
     logging.info(

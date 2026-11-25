@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import io
 import json
 import logging
 import os
@@ -2808,6 +2809,52 @@ def test_download_retries_authentication_and_server_errors(
     assert not responses
 
 
+_SIGNED_URL = (
+    "https://data.example.test/login?code=SECRET-CODE&state=%2Fdata%2Fgranule.nc4"
+)
+
+
+class _FakeSignedFailure(_FakeDownload):
+    def raise_for_status(self):
+        msg = f"{self.status_code} Server Error: Bad Gateway for url: {_SIGNED_URL}"
+        raise build.requests.HTTPError(msg, response=self)
+
+
+def test_url_queries_are_redacted():
+    text = (
+        f"error for url: {_SIGNED_URL}; see https://example.test/a/b.nc4#frag "
+        "and https://example.test/plain.nc4."
+    )
+    redacted = build._redact_url_queries(text)
+    assert "SECRET-CODE" not in redacted
+    assert "frag" not in redacted
+    assert "https://data.example.test/login?<redacted>" in redacted
+    assert "https://example.test/a/b.nc4?<redacted>" in redacted
+    assert "https://example.test/plain.nc4." in redacted
+
+
+def test_download_logs_and_raises_without_url_queries(tmp_path, monkeypatch, caplog):
+    monkeypatch.setattr(build.time, "sleep", lambda _seconds: None)
+    destination = tmp_path / "granule.nc4"
+    responses = [_FakeSignedFailure(502), _FakeDownload(200)]
+    monkeypatch.setattr(build.requests, "get", lambda *_a, **_k: responses.pop(0))
+    with caplog.at_level(logging.WARNING):
+        build._download_granule("https://example.test/granule.nc4", destination)
+    assert "Transient MERRA2 download failure" in caplog.text
+    assert "SECRET-CODE" not in caplog.text
+    assert "login?<redacted>" in caplog.text
+
+    monkeypatch.setattr(
+        build.requests, "get", lambda *_a, **_k: _FakeSignedFailure(404)
+    )
+    with pytest.raises(build.requests.HTTPError) as error:
+        build._download_granule("https://example.test/granule.nc4", destination)
+    assert "SECRET-CODE" not in str(error.value)
+    assert error.value.__cause__ is None
+    assert error.value.__suppress_context__
+    assert error.value.response.status_code == 404
+
+
 def test_download_does_not_retry_a_missing_granule(tmp_path, monkeypatch):
     calls = []
 
@@ -2889,6 +2936,49 @@ def test_month_workers_run_in_separate_processes_with_parent_logging():
         root.setLevel(previous_level)
     assert child_pid != os.getpid()
     assert child_level == logging.INFO
+
+
+def test_builder_logging_redacts_url_queries_in_messages_and_tracebacks():
+    root = logging.getLogger()
+    saved_handlers, saved_level = root.handlers[:], root.level
+    root.handlers = []
+    stream = io.StringIO()
+    try:
+        build._configure_logging(logging.INFO, "%(levelname)s %(message)s")
+        for handler in root.handlers:
+            handler.setStream(stream)
+        try:
+            msg = f"Bad Gateway for url: {_SIGNED_URL}"
+            raise OSError(msg)
+        except OSError as exc:
+            logging.error("range failed (%s)", exc, exc_info=exc)
+    finally:
+        root.handlers, root.level = saved_handlers, saved_level
+    text = stream.getvalue()
+    assert "SECRET-CODE" not in text
+    assert text.count("login?<redacted>") == 2  # message and traceback
+
+
+def test_month_task_installs_url_redaction_on_worker_logging(monkeypatch):
+    # A spawned month worker gets a plain basicConfig handler; the month task
+    # itself switches it to the redacting formatter before doing any work.
+    root = logging.getLogger()
+    handler = logging.StreamHandler(io.StringIO())
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    monkeypatch.setattr(root, "handlers", [handler])
+    monkeypatch.setattr(build, "_month_days", _stop_after_redaction)
+    with pytest.raises(_RedactionInstalled):
+        build._process_month(1, 2024, 2024, None, None, {}, None, 1000, 0)
+    assert isinstance(handler.formatter, build._RedactingFormatter)
+    assert handler.formatter._fmt == "%(message)s"
+
+
+class _RedactionInstalled(Exception):
+    pass
+
+
+def _stop_after_redaction(*_args):
+    raise _RedactionInstalled
 
 
 def _fake_stage_day(started, fail_on=None):
